@@ -12,7 +12,9 @@ Made by [DrogaBox](https://github.com/DrogaBox) & [Izzy](https://github.com/wh0a
 
 AMD Navi 21 GPU: RX 6800, 6800 XT, 6900 XT or 6950 XT. Other cards are untested.
 
-OpenCore hackintosh on one of the validated builds: Sequoia 15.8.2 (24H232), Tahoe 26.7.1 (25G241) or Tahoe 26.7.2 (25G332). Other builds are blocked by default, because an unchecked driver can hang the GPU.
+OpenCore hackintosh on one of the validated builds: Sequoia 15.8.2 (24H232) or 15.8.3 (24H241), Tahoe 26.7.1 (25G241), 26.7.2 (25G332) or 26.7.3 (25G342). Other builds are blocked by default, because an unchecked driver can hang the GPU.
+
+On Sequoia the VP9 decoder is enabled from static validation only: the driver layout and the VCN firmware match Tahoe, but nobody has run it on a Sequoia GPU yet. Run the VP9 check once (see "Validating a new macOS build") and report the result.
 
 Authenticated root disabled, to write the sealed system volume: csrutil authenticated-root disable from Recovery.
 
@@ -78,7 +80,27 @@ machine code is identical: the symbol table's debug map records the build folder
 file timestamps. The installer compares cdhashes,
 so with the released decoders installed it shows **Update** for your build. That's expected.
 
-## Safety
+## Validating a new macOS build
+Get the build's x86_64 dyld shared cache (from an install, or from the update's
+`payloadv2/image_patches/cryptex-system-x86_64` through `tools/rawpatch`) and run:
+```bash
+python3 tools/dscdiff.py info <cache> AMDRadeonVADriver2
+```
+If the UUID is already in `kValidatedDrivers`, the driver is the same binary: add the build to
+`installer/validated-builds.json` and you are done. If it is new, compare it against a validated one
+with `tools/dscdiff.py diff <old cache> <new cache> AMDRadeonVADriver2` and review every changed
+function on the decode path before adding the UUID.
+`tools/mk4k.py` (AV1) and `tools/mkvp9.py` (VP9) make test clips of any size with per-frame
+references for `vtav1test` and `vtvp9test`.
+
+First VP9 run on a build that is listed as `"untested-on-gpu"` (Sequoia today). The bundle is loaded
+in the test process only, nothing is installed, and every frame is compared with a CPU decode:
+```bash
+python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
+./vtvp9/build.sh
+./vtvp9/vtvp9test -load vtvp9/build/VP9VCNDecoder.bundle /tmp/v.ivf /tmp/v.ivf.md5 -id com.droga.videodecoder.vp9.vcn.vp09
+```
+`tools/mkvp9.py` needs PyAV and NumPy. Save your work first: a wrong message can hang the GPU.
 
 - AV1 must only go to VCN instance 0. Instance 1 has no AV1 on Navi 21, and a job sent there hangs
   the GPU. The code pins instance 0. Don't change that.
@@ -91,9 +113,18 @@ so with the released decoders installed it shows **Update** for your build. That
 
 - RX 6800 XT, Tahoe 26.7.1: AV1 and VP9 conformance vectors match bit for bit. YouTube 4K60 plays in
   Safari and Chrome (AV1: 6 dropped of 2509 frames, about 6.8 ms per frame).
-- RX 6900 XT, Sequoia 15.8.2: all AV1 vectors match bit for bit, and AV1 and VP9 playback works.
-  `installer/validated-builds.json` still lists VP9 on 24H232 as `untested-on-gpu`, from before
-  this playback test. That field is informational. It doesn't block anything.
+- RX 6800 XT, Tahoe 26.7.3: 43 AV1 clips and 18 VP9 clips match bit for bit, portrait sizes included
+  (up to 2160x3840).
+- RX 6900 XT, Sequoia 15.8.2: all AV1 vectors match bit for bit and AV1 playback works. VP9 was
+  software there up to 1.0.2, because the VP9 plug-in refused the Sequoia driver.
+- Sequoia VP9, static check only: against the Tahoe driver the AV1 processor and factory vtables have
+  the same slot order, the objects have the same sizes and every offset the plug-in uses matches, and
+  `AMDRadeonX6000HWLibs` carries a byte-identical VCN firmware (`aucVcn3v0_Firmware`). The Sequoia
+  driver is now in `kValidatedDrivers` in `vcnvp9/vcnvp9.c`. Not run on a Sequoia GPU yet.
+- Sequoia 15.8.3 and Tahoe 26.7.3 ship the same driver binaries as 15.8.2 and 26.7.2 (same UUID).
+- Fixed: portrait AV1 video (YouTube Shorts) came out as a blank picture. The driver's AV1 path
+  writes nothing when the output surface's padded height is larger than its pitch. The decoder now
+  widens the rows of such surfaces. VP9 was not affected.
 - 8K AV1 tops out at about 28 fps (about 35 ms per frame). 8K60 needs 16.7 ms.
 - Pinning the GPU clocks with stable power mode gave 4-5% at 4K and 1.4% at 8K, for about 27 W more
   at idle. Not worth it.

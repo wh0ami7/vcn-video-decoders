@@ -105,9 +105,11 @@ static io_service_t find_accelerator(void) {
 // elsewhere unless VCNAV1_ALLOW_UNVALIDATED_DRIVER=1 (after a dry run).
 static const char* const kValidatedDrivers[] = {
     "8D3BA61E7BC73BDFADB3A7866360B6DE",  // macOS 26.7.1 (25G241)
-    "5D90FED3BCBF34759F4B8FC00026D3AB",  // macOS 15.8.2 (24H232): compared in
+    "5D90FED3BCBF34759F4B8FC00026D3AB",  // macOS 15.8.2 (24H232) and 15.8.3
+                                         // (24H241, same binary): compared in
                                          // IDA against 26.7.1, same AV1 path
-    "1181E2CA31B33DF090E23AE70552D753",  // macOS 26.7.2 (25G332): compared in
+    "1181E2CA31B33DF090E23AE70552D753",  // macOS 26.7.2 (25G332) and 26.7.3
+                                         // (25G342, same binary): compared in
                                          // IDA against 26.7.1, same code
 };
 
@@ -151,7 +153,13 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
   PUT(kCVPixelBufferHeightKey, h);
   PUT(kCVPixelBufferBytesPerRowAlignmentKey, 256);
   PUT(kCVPixelBufferPlaneAlignmentKey, 4096);
-  PUT(kCVPixelBufferExtendedPixelsBottomKey, ((h + 63) & ~63u) - h);
+  uint32_t padH = (h + 63) & ~63u, pitch = (w + 255) & ~255u;
+  PUT(kCVPixelBufferExtendedPixelsBottomKey, padH - h);
+  // The driver's AV1 path leaves the picture blank, with no error, when the
+  // padded height is larger than the pitch (portrait video). Widen the rows
+  // until the pitch reaches the padded height.
+  if (padH > pitch)
+    PUT(kCVPixelBufferExtendedPixelsRightKey, ((padH + 255) & ~255u) - w);
 #undef PUT
   CFDictionarySetValue(a, kCVPixelBufferIOSurfacePropertiesKey, io);
   CFDictionarySetValue(a, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);

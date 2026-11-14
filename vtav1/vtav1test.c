@@ -113,6 +113,13 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
   CC_MD5_CTX m;
   CC_MD5_Init(&m);
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
+  // VTAV1_DUMP_Y=<file>: append each frame's 8-bit luma (w*h bytes) to it.
+  const char* dump = getenv("VTAV1_DUMP_Y");
+  if (dump && !ten) {
+    FILE* df = fopen(dump, "ab");
+    for (int r = 0; df && r < h; r++) fwrite(y + r * ys, 1, w, df);
+    if (df) fclose(df);
+  }
   uint16_t* row = malloc((size_t)w * 2 + 16);
   for (int r = 0; r < h; r++) {
     if (ten) {

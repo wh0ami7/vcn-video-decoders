@@ -101,7 +101,7 @@ preflight() {
     done
   fi
   if [[ $hit -eq 1 ]]; then
-    add_check driver "GPU driver validated" ok "$name ($build): AMD VCN driver validated, decoded bit-exact"
+    add_check driver "GPU driver validated" ok "$name ($build): AMD VCN driver validated"
   else
     add_check driver "GPU driver validated" fail "build $build is not in the validated list — installing may HANG the GPU. Validate it first, or override at your own risk."
     SOFT_FAIL=1

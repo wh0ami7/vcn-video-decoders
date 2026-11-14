@@ -1,5 +1,5 @@
 {
-  "_comment": "macOS builds whose AMDRadeonVADriver2 AV1/VP9 VCN layout has been validated in IDA and run bit-exact. Installing on an UNLISTED build is blocked by default (GPU-hang risk) and needs the explicit override in the app. Add a build here only after validating its driver in IDA.",
+  "_comment": "macOS builds whose AMDRadeonVADriver2 was validated. Installing on an UNLISTED build is blocked by default (GPU-hang risk) and needs the explicit override in the app. Add a build only after checking its driver: the same driverUUID as a listed build means the same binary (tools/dscdiff.py info); a new UUID needs the decode path compared first. av1/vp9: true = decoded bit-exact on a GPU, \"untested-on-gpu\" = driver validated but not run yet, false = the plug-in refuses this driver and macOS falls back to software.",
   "schema": 1,
   "validated": [
     {
@@ -8,6 +8,14 @@
       "name": "Sequoia 15.8.2",
       "driverUUID": "5D90FED3BCBF34759F4B8FC00026D3AB",
       "av1": true,
+      "vp9": "untested-on-gpu"
+    },
+    {
+      "build": "24H241",
+      "product": "15.8.3",
+      "name": "Sequoia 15.8.3",
+      "driverUUID": "5D90FED3BCBF34759F4B8FC00026D3AB",
+      "av1": "untested-on-gpu",
       "vp9": "untested-on-gpu"
     },
     {
@@ -23,8 +31,16 @@
       "product": "26.7.2",
       "name": "Tahoe 26.7.2",
       "driverUUID": "1181E2CA31B33DF090E23AE70552D753",
-      "av1": true,
+      "av1": "untested-on-gpu",
       "vp9": "untested-on-gpu"
+    },
+    {
+      "build": "25G342",
+      "product": "26.7.3",
+      "name": "Tahoe 26.7.3",
+      "driverUUID": "1181E2CA31B33DF090E23AE70552D753",
+      "av1": true,
+      "vp9": true
     }
   ],
   "supportedGPUs": [
