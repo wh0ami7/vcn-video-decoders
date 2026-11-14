@@ -86,12 +86,16 @@ struct VcnVP9 {
 #define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
 
 // Every offset below was read from the 26.7.2 database, whose decoder code
-// matches 26.7.1. 15.8.2 still has to be compared before it goes in this list.
+// matches 26.7.1. The Sequoia driver was compared against it in IDA: same
+// vtable slots, object sizes and offsets on everything used here, and its kext
+// loads the same VCN firmware image.
 static const char* const kValidatedDrivers[] = {
+    "5D90FED3BCBF34759F4B8FC00026D3AB",  // macOS 15.8.2 (24H232) and 15.8.3
+                                         // (24H241, same binary)
     "8D3BA61E7BC73BDFADB3A7866360B6DE",  // macOS 26.7.1 (25G241)
-    "1181E2CA31B33DF090E23AE70552D753",  // macOS 26.7.2 (25G332)
+    "1181E2CA31B33DF090E23AE70552D753",  // macOS 26.7.2 (25G332) and 26.7.3
+                                         // (25G342, same binary)
 };
-
 static bool driver_uuid(char out[33]) {
   for (uint32_t i = 0; i < _dyld_image_count(); i++) {
     if (!strstr(_dyld_get_image_name(i), "AMDRadeonVADriver2")) continue;
