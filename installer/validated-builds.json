@@ -8,7 +8,7 @@
       "name": "Sequoia 15.8.2",
       "driverUUID": "5D90FED3BCBF34759F4B8FC00026D3AB",
       "av1": true,
-      "vp9": "untested-on-gpu"
+      "vp9": true
     },
     {
       "build": "24H241",

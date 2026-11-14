@@ -14,7 +14,7 @@ AMD Navi 21 GPU: RX 6800, 6800 XT, 6900 XT or 6950 XT. Other cards are untested.
 
 OpenCore hackintosh on one of the validated builds: Sequoia 15.8.2 (24H232) or 15.8.3 (24H241), Tahoe 26.7.1 (25G241), 26.7.2 (25G332) or 26.7.3 (25G342). Other builds are blocked by default, because an unchecked driver can hang the GPU.
 
-On Sequoia the VP9 decoder is enabled from static validation only: the driver layout and the VCN firmware match Tahoe, but nobody has run it on a Sequoia GPU yet. Run the VP9 check once (see "Validating a new macOS build") and report the result.
+On Sequoia the VP9 decoder has been run on one GPU so far (RX 6900 XT, 15.8.2). On 15.8.3, which ships the same driver binary, run the VP9 check once (see "Validating a new macOS build") and report the result.
 
 Authenticated root disabled, to write the sealed system volume: csrutil authenticated-root disable from Recovery.
 
@@ -93,7 +93,7 @@ function on the decode path before adding the UUID.
 `tools/mk4k.py` (AV1) and `tools/mkvp9.py` (VP9) make test clips of any size with per-frame
 references for `vtav1test` and `vtvp9test`.
 
-First VP9 run on a build that is listed as `"untested-on-gpu"` (Sequoia today). The bundle is loaded
+First VP9 run on a build that is listed as `"untested-on-gpu"`. The bundle is loaded
 in the test process only, nothing is installed, and every frame is compared with a CPU decode:
 ```bash
 python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
@@ -115,12 +115,14 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
   Safari and Chrome (AV1: 6 dropped of 2509 frames, about 6.8 ms per frame).
 - RX 6800 XT, Tahoe 26.7.3: 43 AV1 clips and 18 VP9 clips match bit for bit, portrait sizes included
   (up to 2160x3840).
-- RX 6900 XT, Sequoia 15.8.2: all AV1 vectors match bit for bit and AV1 playback works. VP9 was
-  software there up to 1.0.2, because the VP9 plug-in refused the Sequoia driver.
-- Sequoia VP9, static check only: against the Tahoe driver the AV1 processor and factory vtables have
+- RX 6900 XT, Sequoia 15.8.2: all AV1 vectors match bit for bit and AV1 playback works, portrait
+  Shorts included. VP9: the dry runs pass and the 640x360 check clip decodes on the GPU with 30
+  frames, 0 mismatches. The larger VP9 clip set was not run there. VP9 was software up to 1.0.2,
+  because the VP9 plug-in refused the Sequoia driver.
+- Sequoia VP9, static check: against the Tahoe driver the AV1 processor and factory vtables have
   the same slot order, the objects have the same sizes and every offset the plug-in uses matches, and
   `AMDRadeonX6000HWLibs` carries a byte-identical VCN firmware (`aucVcn3v0_Firmware`). The Sequoia
-  driver is now in `kValidatedDrivers` in `vcnvp9/vcnvp9.c`. Not run on a Sequoia GPU yet.
+  driver is now in `kValidatedDrivers` in `vcnvp9/vcnvp9.c`.
 - Sequoia 15.8.3 and Tahoe 26.7.3 ship the same driver binaries as 15.8.2 and 26.7.2 (same UUID).
 - Fixed: portrait AV1 video (YouTube Shorts) came out as a blank picture. The driver's AV1 path
   writes nothing when the output surface's padded height is larger than its pitch. The decoder now
