@@ -116,11 +116,24 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
   // VTAV1_DUMP_Y=<file>: append each frame's 8-bit luma (w*h bytes) to it.
   const char* dump = getenv("VTAV1_DUMP_Y");
   if (dump && !ten) {
-    FILE* df = fopen(dump, "ab");
-    for (int r = 0; df && r < h; r++) fwrite(y + r * ys, 1, w, df);
-    if (df) fclose(df);
+    int ok_path = 1;
+    for (const unsigned char* c = (const unsigned char*)dump; *c; c++) {
+      if (*c < 0x20 || *c == 0x7f ||
+          !((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+            (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '/' ||
+            *c == '-')) {
+        ok_path = 0;
+        break;
+      }
+    }
+    if (ok_path && !strstr(dump, "..")) {
+      FILE* df = fopen(dump, "ab");
+      for (int r = 0; df && r < h; r++) fwrite(y + r * ys, 1, w, df);
+      if (df) fclose(df);
+    }
   }
   uint16_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) return;
   for (int r = 0; r < h; r++) {
     if (ten) {
       uint16_t* src = (uint16_t*)(y + r * ys);

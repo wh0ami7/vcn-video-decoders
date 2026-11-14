@@ -32,10 +32,11 @@ static UserPatcher::ProcInfo procInfo[]{
 //      plug-in ; (disable set) -> fall through to add_item
 //
 //  We flip the `jnz short add_item` (75 0d) into an unconditional `jmp short
-//  add_item` (eb 0d), so every discovered plug-in is added regardless of
-//  signature — scoped by UserPatcher to only com.apple.WebKit.GPU /
-//  VTDecoderXPCService (above). No other process's code-signing is touched, and
-//  /System plug-ins (which never reach this branch) are unaffected.
+//  add_item` (eb 0d), so every /Library plug-in those processes discover is
+//  added regardless of signature. Scoped by UserPatcher to only
+//  com.apple.WebKit.GPU / VTDecoderXPCService (above) — not VCN-cdhash-scoped.
+//  No other process's code-signing is touched, and /System plug-ins (which
+//  never reach this branch) are unaffected.
 //
 //  The 11-byte pattern below is byte-identical in 15.8.2 (24H232), 26.7.1
 //  (25G241) and 26.7.2 (25G332) — verified to occur exactly once in each

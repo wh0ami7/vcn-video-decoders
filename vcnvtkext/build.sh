@@ -24,6 +24,7 @@ FLAGS=(
   -DMODULE_VERSION=1.0.0 "-DPRODUCT_NAME=$NAME"
   -I. -I"$LILU_HDR" -I"$MKSDK/Headers"
   -Oz -flto=thin -fno-exceptions -fno-rtti
+  -Wall -Wextra -Wno-unused-parameter
 )
 SRC=( kern_start.cpp kern_amfi.cpp kern_coremedia.cpp "$LILU_LIB/plugin_start.cpp" )
 

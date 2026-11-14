@@ -21,6 +21,8 @@ typedef struct {
 } Container;
 
 static inline bool container_open(Container* c, const char* path) {
+  // Cap test-tool loads so a hostile file cannot OOM the process.
+  enum { kMaxContainerBytes = 512u * 1024u * 1024u };
   memset(c, 0, sizeof(*c));
   if (!path) return false;
   FILE* fp = fopen(path, "rb");
@@ -30,12 +32,13 @@ static inline bool container_open(Container* c, const char* path) {
     return false;
   }
   long n = ftell(fp);
-  if (n < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+  if (n < 0 || (unsigned long)n > kMaxContainerBytes ||
+      fseek(fp, 0, SEEK_SET) != 0) {
     fclose(fp);
     return false;
   }
   if (n > 0) {
-    c->data = malloc((size_t)n);
+    c->data = (uint8_t*)malloc((size_t)n);
     if (!c->data) {
       fclose(fp);
       return false;
@@ -52,7 +55,14 @@ static inline bool container_open(Container* c, const char* path) {
   }
   if (c->size >= 32 && !memcmp(c->data, "DKIF", 4)) {
     c->ivf = true;
-    c->pos = (size_t)(c->data[6] | c->data[7] << 8);
+    size_t hdr = (size_t)(c->data[6] | (c->data[7] << 8));
+    if (hdr < 32 || hdr > c->size) {
+      free(c->data);
+      c->data = NULL;
+      c->size = 0;
+      return false;
+    }
+    c->pos = hdr;
   }
   return true;
 }
@@ -106,7 +116,7 @@ static inline void webm_read_tracks(Container* c, size_t end) {
     uint32_t id;
     uint64_t sz;
     if (!ebml_id(c, &id) || !ebml_size(c, &sz, NULL)) break;
-    if (c->pos + sz > end) break;
+    if (sz > end - c->pos) break;
     if (id == 0xAE) {  // TrackEntry
       size_t entry_end = c->pos + (size_t)sz;
       uint64_t number = 0, type = 0;
@@ -114,7 +124,7 @@ static inline void webm_read_tracks(Container* c, size_t end) {
         uint32_t eid;
         uint64_t esz;
         if (!ebml_id(c, &eid) || !ebml_size(c, &esz, NULL) ||
-            c->pos + esz > entry_end)
+            esz > entry_end - c->pos)
           break;
         if ((eid == 0xD7 || eid == 0x83) && esz <= 8) {
           uint64_t v = 0;
@@ -144,8 +154,9 @@ static inline bool container_next(Container* c, const uint8_t** out,
     const uint8_t* h = c->data + c->pos;
     size_t s = (size_t)h[0] | (size_t)h[1] << 8 | (size_t)h[2] << 16 |
                (size_t)h[3] << 24;
+    enum { kMaxFrameBytes = 0x1800000u };
     c->pos += 12;
-    if (c->pos + s > c->size) return false;
+    if (!s || s > kMaxFrameBytes || c->pos + s > c->size) return false;
     *out = c->data + c->pos;
     *size = s;
     c->pos += s;
@@ -159,7 +170,7 @@ static inline bool container_next(Container* c, const uint8_t** out,
     if (id == 0x18538067 || id == 0x1F43B675 || id == 0xA0)
       continue;  // Segment, Cluster, BlockGroup: descend
     if (unknown) return false;
-    if (c->pos + sz > c->size) return false;
+    if (sz > c->size - c->pos) return false;
     if (id == 0x1654AE6B) webm_read_tracks(c, c->pos + (size_t)sz);
     if (id == 0xA3 || id == 0xA1) {  // SimpleBlock, Block
       size_t start = c->pos;

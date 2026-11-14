@@ -3,17 +3,15 @@
 //
 //  Lets the AMD VCN AV1/VP9 VideoToolbox plugins load from
 //  /Library/Video/Plug-Ins instead of the sealed /System volume. Two
-//  independent barriers are removed, each scoped to our two allow-listed plugin
-//  cdhashes / the two media processes:
+//  independent barriers are removed:
 //
-//   * AMFI library validation (kernel) — kern_amfi.cpp. Self-contained, so the
-//   kext works
-//     WITHOUT AMFIPass. If AMFIPass (or amfi_get_out_of_my_way) is present our
-//     hook simply never fires, so it is harmless alongside it.
+//   * AMFI library validation (kernel) — kern_amfi.cpp. Scoped to the two
+//     allow-listed plugin cdhashes. Self-contained without AMFIPass; if
+//     AMFIPass (or amfi_get_out_of_my_way) is present the hook never fires.
 //   * CoreMedia figRegistry code-signature check (userspace) —
-//   kern_coremedia.cpp, applied only
-//     inside com.apple.WebKit.GPU / VTDecoderXPCService, so plugins can live in
-//     /Library.
+//     kern_coremedia.cpp, only inside com.apple.WebKit.GPU /
+//     VTDecoderXPCService. That patch accepts any /Library plug-in those
+//     processes discover; trust still depends on AMFI for mapping.
 //
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>

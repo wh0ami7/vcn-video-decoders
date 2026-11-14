@@ -6,11 +6,13 @@
 //  code-signature requirement (SecStaticCode vs
 //  kFigRegistryAppleCodeSignRequirement). Our adhoc plugins fail it, so today
 //  they must live in /System/Library/Video/Plug-Ins (scanned with no check),
-//  which needs the sealed-volume root patch. This neutralises that check — in
-//  userspace, only inside com.apple.WebKit.GPU and VTDecoderXPCService — so the
-//  bundles can load from /Library with no root patch. AMFI (mapping adhoc code
-//  into those platform processes) is handled separately by AMFIPass.kext,
-//  already standard on OpenCore.
+//  which needs the sealed-volume root patch. This neutralises that check in
+//  userspace inside com.apple.WebKit.GPU and VTDecoderXPCService only.
+//
+//  Scope note: the byte patch accepts every non-/System plug-in those two
+//  processes discover under /Library (not VCN-only). AMFI still gates mapping
+//  of adhoc code; AmfiBypass (or AMFIPass) must allow the library, and VCN
+//  plugins are further constrained by their cdhash allow-list there.
 //
 
 #ifndef VCNVTKEXT_KERN_COREMEDIA_HPP_

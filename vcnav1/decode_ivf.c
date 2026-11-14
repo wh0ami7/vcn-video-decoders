@@ -172,8 +172,10 @@ int main(int argc, char** argv) {
   size_t header_read = 0;
   while ((header_read = fread(fh, 1, sizeof(fh), fp)) == sizeof(fh)) {
     uint32_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (uint32_t)fh[3] << 24;
-    if (!sz) {
-      fprintf(stderr, "invalid empty frame at TU %d\n", n);
+    // Bound hostile IVF sizes before allocation (matches VCN BS_SIZE).
+    enum { kMaxTuBytes = 0x1800000u };
+    if (!sz || sz > kMaxTuBytes) {
+      fprintf(stderr, "invalid frame size %u at TU %d\n", sz, n);
       goto done;
     }
     buf = malloc((size_t)sz);

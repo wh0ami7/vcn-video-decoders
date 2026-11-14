@@ -811,6 +811,16 @@ int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
 // Used by the dry run script: copy memory to a file from inside the process.
 __attribute__((noinline, used)) int vcnvp9_dump(const void* p, long n,
                                                 const char* path) {
+  // Dry-run only: refuse odd sizes and path characters that break C exprs.
+  if (!p || !path || n <= 0 || n > 64 * 1024 * 1024) return -1;
+  for (const unsigned char* c = (const unsigned char*)path; *c; c++) {
+    if (*c < 0x20 || *c == 0x7f) return -1;
+    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+          (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '/' ||
+          *c == '-'))
+      return -1;
+  }
+  if (strstr(path, "..")) return -1;
   FILE* f = fopen(path, "wb");
   if (!f) return -1;
   long w = (long)fwrite(p, 1, (size_t)n, f);

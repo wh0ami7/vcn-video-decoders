@@ -7,18 +7,29 @@
 //  Linux runs VCN under the VIDEO profile instead. This plugin answers that one
 //  registry read with another mask and logs what actually reaches the firmware.
 //
-//  Boot args: -vcnvpoff disables it, vcnwlmask=N picks the mask (default 4,
-//  VIDEO; valid 1..127). Bits, per Phw_SwSmu_WorkLoadPolicyManager's log
-//  strings: 1 FULLSCREEN3D, 2 POWERSAVING, 4 VIDEO, 8 VR, 0x10 COMPUTE, 0x20
-//  CUSTOM, 0x40 W3D.
+//  Boot args: -vcnvpoff disables it, vcnwlmask=N picks the mask (default
+//  kWlVideo / 4; valid 1..127). Named bits: kWlFullscreen3D, kWlPowerSaving,
+//  kWlVideo, kWlVr, kWlCompute, kWlCustom, kWlW3D.
 //
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
 
-static constexpr uint32_t kDefaultMask = 4;
-static constexpr uint32_t kMaxMask = 0x7F;
+// Bits from Phw_SwSmu_WorkLoadPolicyManager log strings.
+enum : uint32_t {
+  kWlFullscreen3D = 1u << 0,
+  kWlPowerSaving = 1u << 1,
+  kWlVideo = 1u << 2,
+  kWlVr = 1u << 3,
+  kWlCompute = 1u << 4,
+  kWlCustom = 1u << 5,
+  kWlW3D = 1u << 6,
+};
+static constexpr uint32_t kDefaultMask = kWlVideo;
+static constexpr uint32_t kMaxMask =
+    kWlFullscreen3D | kWlPowerSaving | kWlVideo | kWlVr | kWlCompute |
+    kWlCustom | kWlW3D;
 static constexpr int kValidatedKernelMinor =
     6;  // Darwin 25.6, the build these signatures were read from
 static constexpr int kMaxPolicyLogs = 16;
@@ -45,10 +56,11 @@ static int64_t wrapReadRegistry(void* peci, const char* key, uint32_t* data,
                                 uint32_t defaultValue) {
   int64_t result = orgReadRegistry(peci, key, data, defaultValue);
   if (key && data && strcmp(key, "PP_WorkLoadPolicyMask") == 0) {
+    uint32_t answer = __atomic_load_n(&gMask, __ATOMIC_RELAXED);
     SYSLOG("vcnvp",
            "PP_WorkLoadPolicyMask read %u, answering %u (read result %lld)",
-           *data, gMask, result);
-    *data = gMask;
+           *data, answer, result);
+    *data = answer;
   }
   return result;
 }
@@ -59,17 +71,22 @@ using t_setPolicy = int64_t (*)(void* smum, uint32_t mask);
 static t_setPolicy orgSetPolicy{nullptr};
 
 static int64_t wrapSetPolicy(void* smum, uint32_t mask) {
+  // Freestanding kext (-nostdinc++): no <atomic>. Use builtins so concurrent
+  // SMU callbacks cannot race the dedupe state (C++ Core Guidelines CP).
   static uint32_t lastMask = UINT32_MAX;
   static int64_t lastResult = INT64_MIN;
   static int logged = 0;
   int64_t result = orgSetPolicy(smum, mask);
-  if ((mask != lastMask || result != lastResult) && logged < kMaxPolicyLogs) {
-    SYSLOG("vcnvp", "firmware workload policy mask %u, result %lld", mask,
-           result);
-    logged++;
+  uint32_t prevMask = __atomic_exchange_n(&lastMask, mask, __ATOMIC_RELAXED);
+  int64_t prevResult =
+      __atomic_exchange_n(&lastResult, result, __ATOMIC_RELAXED);
+  if (mask != prevMask || result != prevResult) {
+    int n = __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED);
+    if (n < kMaxPolicyLogs) {
+      SYSLOG("vcnvp", "firmware workload policy mask %u, result %lld", mask,
+             result);
+    }
   }
-  lastMask = mask;
-  lastResult = result;
   return result;
 }
 
@@ -82,7 +99,8 @@ static void onHWLibsLoad(void*, KernelPatcher& patcher, size_t index,
       {"_SW_SMUM_Dpm_SetWorkloadPolicy", wrapSetPolicy, orgSetPolicy},
   };
   if (patcher.routeMultiple(index, requests, address, size))
-    SYSLOG("vcnvp", "routed, workload mask override %u", gMask);
+    SYSLOG("vcnvp", "routed, workload mask override %u",
+           __atomic_load_n(&gMask, __ATOMIC_RELAXED));
   else {
     SYSLOG("vcnvp", "route failed (%d), driver left as it is",
            patcher.getError());
@@ -115,9 +133,10 @@ PluginConfiguration ADDPR(config){
       uint32_t requested = 0;
       if (PE_parse_boot_argn("vcnwlmask", &requested, sizeof(requested))) {
         if (requested >= 1 && requested <= kMaxMask)
-          gMask = requested;
+          __atomic_store_n(&gMask, requested, __ATOMIC_RELAXED);
         else
-          SYSLOG("vcnvp", "ignoring vcnwlmask=%u, using %u", requested, gMask);
+          SYSLOG("vcnvp", "ignoring vcnwlmask=%u, using %u", requested,
+                 __atomic_load_n(&gMask, __ATOMIC_RELAXED));
       }
       lilu.onKextLoadForce(&kextHWLibs, 1, onHWLibsLoad, nullptr);
     }};

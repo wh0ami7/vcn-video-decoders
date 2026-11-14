@@ -10,7 +10,7 @@ B=build/AV1VCNDecoder.bundle
 rm -rf "${B}"
 mkdir -p "${B}/Contents/MacOS"
 cp Info.plist "${B}/Contents/Info.plist"
-clang -arch x86_64 -O2 -g -bundle -fvisibility=hidden -Wall -Wno-unused-function \
+clang -arch x86_64 -O2 -g -bundle -fvisibility=hidden -Wall -Wextra -Wno-unused-parameter -Wno-unused-function \
   -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security \
   -fno-strict-overflow \
   -Wno-four-char-constants -Wno-deprecated-declarations -mmacosx-version-min=13.0 \

@@ -533,8 +533,14 @@ static int submit(VcnAV1* d, AV1Params* prm) {
   // Third field of the query entry is the driver's completion-poll interval in
   // ms: AppleGVA's 5 adds ~5 ms of latency per frame; 1 measured 2.5 ms average
   // wait vs 5.7 ms, bit-exact.
-  if (qmode < 0)
-    qmode = getenv("VCNAV1_QMODE") ? atoi(getenv("VCNAV1_QMODE")) : 1;
+  if (qmode < 0) {
+    // Env-derived poll interval: reject non-digits / out-of-range (mem:security).
+    const char* qs = getenv("VCNAV1_QMODE");
+    char* end = NULL;
+    long v = qs ? strtol(qs, &end, 10) : 1;
+    if (!qs || end == qs || *end || v < 1 || v > 100) v = 1;
+    qmode = (int)v;
+  }
   AVD_QueryEntry qe = {
       .refcon = refcons[0], .pollMs = (uint32_t)qmode, .wait = 1};
   AVD_QueryList ql = {.count = 1, .entries = &qe};
@@ -659,6 +665,16 @@ void vcnav1_flush(VcnAV1* d) {
 // inside the process.
 __attribute__((noinline, used)) int vcnav1_dump(const void* p, long n,
                                                 const char* path) {
+  // Dry-run only: refuse odd sizes and path characters that break C exprs.
+  if (!p || !path || n <= 0 || n > 64 * 1024 * 1024) return -1;
+  for (const unsigned char* c = (const unsigned char*)path; *c; c++) {
+    if (*c < 0x20 || *c == 0x7f) return -1;
+    if (!((*c >= 'A' && *c <= 'Z') || (*c >= 'a' && *c <= 'z') ||
+          (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '/' ||
+          *c == '-'))
+      return -1;
+  }
+  if (strstr(path, "..")) return -1;
   FILE* f = fopen(path, "wb");
   if (!f) return -1;
   long w = (long)fwrite(p, 1, (size_t)n, f);

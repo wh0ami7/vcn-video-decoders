@@ -6,7 +6,10 @@
 # Installs nothing. decode_ivf refuses to touch the GPU unless VCNAV1_ALLOW_GPU is set.
 set -e
 cd "${0:A:h}"
-CF=(-arch x86_64 -O1 -g -mmacosx-version-min=13.0 -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security -fno-strict-overflow -Wno-four-char-constants -Wno-deprecated-declarations -Wno-unused-function)
+CF=(-arch x86_64 -O1 -g -mmacosx-version-min=13.0 -Wall -Wextra -Wno-unused-parameter
+  -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security
+  -fno-strict-overflow -Wno-four-char-constants -Wno-deprecated-declarations
+  -Wno-unused-function)
 clang "${CF[@]}" av1parse.c vcnav1.c decode_ivf.c \
   -framework IOKit -framework IOSurface -framework CoreFoundation -framework CoreVideo -o decode_ivf
 clang "${CF[@]}" ../vtav1/vtav1test.c av1parse.c \
