@@ -297,6 +297,8 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
     status = kVTVideoDecoderBadDataErr;
   else if (CMBlockBufferIsRangeContiguous(bb, 0, len) &&
            !CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &ptr) && ptr) {
+  } else if (len > 0x1800000u) {
+    status = kVTVideoDecoderBadDataErr;
   } else {
     copy = malloc(len);
     if (!copy || CMBlockBufferCopyDataBytes(bb, 0, len, copy))

@@ -3,11 +3,23 @@
 // [width=1920] [height=1080]
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "avd.h"
+
+static int parse_u32_arg(const char* s, uint32_t lo, uint32_t hi, uint32_t* out) {
+  if (!s || !out) return -1;
+  errno = 0;
+  char* end = NULL;
+  unsigned long v = strtoul(s, &end, 10);
+  if (!end || end == s || *end || errno == ERANGE || v < lo || v > hi) return -1;
+  *out = (uint32_t)v;
+  return 0;
+}
 
 static io_service_t findAccelerator(void) {
   io_iterator_t it;
@@ -30,10 +42,30 @@ static io_service_t findAccelerator(void) {
 }
 
 int main(int argc, char** argv) {
-  uint64_t func = argc > 1 ? strtoull(argv[1], NULL, 16) : AVD_FUNC_AV1;
-  uint32_t mode = argc > 2 ? atoi(argv[2]) : 5;
-  uint32_t w = argc > 3 ? atoi(argv[3]) : 1920,
-           h = argc > 4 ? atoi(argv[4]) : 1080;
+  uint64_t func = AVD_FUNC_AV1;
+  uint32_t mode = 5, w = 1920, h = 1080;
+  if (argc > 1) {
+    errno = 0;
+    char* end = NULL;
+    unsigned long long v = strtoull(argv[1], &end, 16);
+    if (!end || end == argv[1] || *end || errno == ERANGE) {
+      fprintf(stderr, "invalid function hex\n");
+      return 1;
+    }
+    func = (uint64_t)v;
+  }
+  if (argc > 2 && parse_u32_arg(argv[2], 0, 255, &mode)) {
+    fprintf(stderr, "invalid mode\n");
+    return 1;
+  }
+  if (argc > 3 && parse_u32_arg(argv[3], 1, 8192, &w)) {
+    fprintf(stderr, "invalid width\n");
+    return 1;
+  }
+  if (argc > 4 && parse_u32_arg(argv[4], 1, 8192, &h)) {
+    fprintf(stderr, "invalid height\n");
+    return 1;
+  }
 
   void* lib = dlopen(AVD_DRIVER_PATH, RTLD_NOW | RTLD_LOCAL);
   if (!lib) {
@@ -45,6 +77,10 @@ int main(int argc, char** argv) {
   printf("AVD_CreateAVDAccelerator=%p\n", create);
 
   io_service_t svc = findAccelerator();
+  if (!svc) {
+    fprintf(stderr, "no AMD accelerator\n");
+    return 1;
+  }
   uint64_t regid = 0;
   IORegistryEntryGetRegistryEntryID(svc, &regid);
   printf("accelerator service=0x%x regid=0x%llx\n", svc, regid);

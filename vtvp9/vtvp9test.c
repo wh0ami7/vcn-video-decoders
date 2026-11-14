@@ -11,6 +11,7 @@
 #include <CoreMedia/CoreMedia.h>
 #include <VideoToolbox/VideoToolbox.h>
 #include <dlfcn.h>
+#include <limits.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +132,10 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
   CC_MD5_Init(&m);
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
   uint16_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+    return;
+  }
   for (int r = 0; r < h; r++) {
     if (ten) {
       uint16_t* src = (uint16_t*)(y + r * ys);
@@ -214,13 +219,34 @@ int main(int argc, char** argv) {
       async = 1;
     else if (!strcmp(argv[i], "-sw"))
       require_hw = 0;
-    else if (!strcmp(argv[i], "-pace") && i + 1 < argc)
-      pace = atof(argv[++i]);
-    else if (!strcmp(argv[i], "-loop") && i + 1 < argc)
-      loops = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "-frames") && i + 1 < argc)
-      limit = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "-id") && i + 1 < argc)
+    else if (!strcmp(argv[i], "-pace") && i + 1 < argc) {
+      const char* s = argv[++i];
+      char* end = NULL;
+      double v = strtod(s, &end);
+      if (!end || end == s || *end || v < 0) {
+        fprintf(stderr, "invalid -pace\n");
+        return 1;
+      }
+      pace = v;
+    } else if (!strcmp(argv[i], "-loop") && i + 1 < argc) {
+      const char* s = argv[++i];
+      char* end = NULL;
+      long v = strtol(s, &end, 10);
+      if (!end || end == s || *end || v < 1 || v > INT_MAX) {
+        fprintf(stderr, "invalid -loop\n");
+        return 1;
+      }
+      loops = (int)v;
+    } else if (!strcmp(argv[i], "-frames") && i + 1 < argc) {
+      const char* s = argv[++i];
+      char* end = NULL;
+      long v = strtol(s, &end, 10);
+      if (!end || end == s || *end || v < 0 || v > INT_MAX) {
+        fprintf(stderr, "invalid -frames\n");
+        return 1;
+      }
+      limit = (int)v;
+    } else if (!strcmp(argv[i], "-id") && i + 1 < argc)
       decoderID = argv[++i];
     else
       refPath = argv[i];
@@ -233,13 +259,44 @@ int main(int argc, char** argv) {
   size_t cap = 4096, cnt = 0;
   const uint8_t** chunks = malloc(cap * sizeof(*chunks));
   size_t* sizes = malloc(cap * sizeof(*sizes));
+  if (!chunks || !sizes) {
+    free(chunks);
+    free(sizes);
+    container_close(&f);
+    fprintf(stderr, "out of memory\n");
+    return 1;
+  }
   const uint8_t* data;
   size_t size;
   while ((!limit || (int)cnt < limit) && container_next(&f, &data, &size)) {
     if (cnt == cap) {
-      cap *= 2;
-      chunks = realloc(chunks, cap * sizeof(*chunks));
-      sizes = realloc(sizes, cap * sizeof(*sizes));
+      if (cap > SIZE_MAX / 2) {
+        free(chunks);
+        free(sizes);
+        container_close(&f);
+        fprintf(stderr, "too many frames\n");
+        return 1;
+      }
+      size_t ncap = cap * 2;
+      const uint8_t** nchunks = realloc(chunks, ncap * sizeof(*chunks));
+      if (!nchunks) {
+        free(chunks);
+        free(sizes);
+        container_close(&f);
+        fprintf(stderr, "out of memory\n");
+        return 1;
+      }
+      chunks = nchunks;
+      size_t* nsizes = realloc(sizes, ncap * sizeof(*sizes));
+      if (!nsizes) {
+        free(chunks);
+        free(sizes);
+        container_close(&f);
+        fprintf(stderr, "out of memory\n");
+        return 1;
+      }
+      sizes = nsizes;
+      cap = ncap;
     }
     chunks[cnt] = data;
     sizes[cnt++] = size;

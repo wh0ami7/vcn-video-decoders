@@ -175,21 +175,30 @@ static int noop_frame(void* ctx, AV1Parser* p, AV1ParseResult k) { return 0; }
 
 // Build an av1C record (ISO/IEC AV1-ISOBMFF 2.3) from the first temporal unit.
 static CFDataRef make_av1C(const uint8_t* tu, size_t n) {
+  if (!tu || !n) return NULL;
   size_t o = 0;
   while (o < n) {
     uint8_t hdr = tu[o];
     int type = (hdr >> 3) & 15, ext = (hdr >> 2) & 1, has = (hdr >> 1) & 1;
-    size_t p = o + 1 + ext, sz = 0;
+    size_t p = o + 1 + (size_t)ext;
+    if (p > n) return NULL;
+    size_t sz = 0;
     for (int i = 0, sh = 0; has && i < 8; i++, sh += 7) {
+      if (p >= n) return NULL;
       uint8_t b = tu[p++];
       sz |= (size_t)(b & 0x7f) << sh;
       if (!(b & 0x80)) break;
     }
-    if (!has) sz = n - p;
+    if (!has) {
+      sz = n - p;
+    } else if (sz > n - p) {
+      return NULL;
+    }
+    size_t obu_len = p + sz - o;
     if (type == 1) {
       AV1Parser ps;
       av1_parser_init(&ps);
-      av1_parse_temporal_unit(&ps, tu + o, p + sz - o, noop_frame, NULL);
+      av1_parse_temporal_unit(&ps, tu + o, obu_len, noop_frame, NULL);
       uint8_t rec[4] = {
           0x81, (uint8_t)(ps.seq.seq_profile << 5 | 13),
           (uint8_t)(ps.seq.high_bitdepth << 6 | ps.seq.twelve_bit << 5 |
@@ -199,7 +208,7 @@ static CFDataRef make_av1C(const uint8_t* tu, size_t n) {
       av1_parser_free(&ps);
       CFMutableDataRef d = CFDataCreateMutable(NULL, 0);
       CFDataAppendBytes(d, rec, 4);
-      CFDataAppendBytes(d, tu + o, p + sz - o);
+      CFDataAppendBytes(d, tu + o, obu_len);
       return d;
     }
     o = p + sz;
@@ -227,9 +236,16 @@ int main(int argc, char** argv) {
       c.nohash = 1;
     else if (!strcmp(argv[i], "-a"))
       async = 1;
-    else if (!strcmp(argv[i], "-pace") && i + 1 < argc)
-      pace = atof(argv[++i]);
-    else if (!strcmp(argv[i], "-id") && i + 1 < argc)
+    else if (!strcmp(argv[i], "-pace") && i + 1 < argc) {
+      const char* s = argv[++i];
+      char* end = NULL;
+      double v = strtod(s, &end);
+      if (!end || end == s || *end || v < 0) {
+        fprintf(stderr, "invalid -pace\n");
+        return 1;
+      }
+      pace = v;
+    } else if (!strcmp(argv[i], "-id") && i + 1 < argc)
       decoderID = argv[++i];
     else
       c.md5 = fopen(argv[i], "r");
@@ -245,25 +261,90 @@ int main(int argc, char** argv) {
     return 1;
   }
   int w = hdr[12] | hdr[13] << 8, h = hdr[14] | hdr[15] << 8;
-  // read all temporal units
+  // Bound hostile IVF sizes before allocation (matches VCN BS_SIZE).
+  enum { kMaxTuBytes = 0x1800000u };
   size_t cap = 64, cnt = 0;
   uint8_t** tus = malloc(cap * sizeof(*tus));
   size_t* sizes = malloc(cap * sizeof(*sizes));
+  if (!tus || !sizes) {
+    free(tus);
+    free(sizes);
+    fclose(fp);
+    fprintf(stderr, "out of memory\n");
+    return 1;
+  }
   uint8_t fh[12];
   while (fread(fh, 1, 12, fp) == 12) {
     uint32_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (uint32_t)fh[3] << 24;
+    if (!sz || sz > kMaxTuBytes) {
+      fprintf(stderr, "invalid frame size %u\n", sz);
+      for (size_t i = 0; i < cnt; i++) free(tus[i]);
+      free(tus);
+      free(sizes);
+      fclose(fp);
+      return 1;
+    }
     if (cnt == cap) {
-      cap *= 2;
-      tus = realloc(tus, cap * sizeof(*tus));
-      sizes = realloc(sizes, cap * sizeof(*sizes));
+      if (cap > SIZE_MAX / 2) {
+        fprintf(stderr, "too many frames\n");
+        for (size_t i = 0; i < cnt; i++) free(tus[i]);
+        free(tus);
+        free(sizes);
+        fclose(fp);
+        return 1;
+      }
+      size_t ncap = cap * 2;
+      uint8_t** ntus = realloc(tus, ncap * sizeof(*tus));
+      if (!ntus) {
+        for (size_t i = 0; i < cnt; i++) free(tus[i]);
+        free(tus);
+        free(sizes);
+        fclose(fp);
+        fprintf(stderr, "out of memory\n");
+        return 1;
+      }
+      tus = ntus;
+      size_t* nsizes = realloc(sizes, ncap * sizeof(*sizes));
+      if (!nsizes) {
+        for (size_t i = 0; i < cnt; i++) free(tus[i]);
+        free(tus);
+        free(sizes);
+        fclose(fp);
+        fprintf(stderr, "out of memory\n");
+        return 1;
+      }
+      sizes = nsizes;
+      cap = ncap;
     }
     tus[cnt] = malloc(sz);
-    if (fread(tus[cnt], 1, sz, fp) != sz) break;
+    if (!tus[cnt]) {
+      fprintf(stderr, "out of memory reading frame\n");
+      for (size_t i = 0; i < cnt; i++) free(tus[i]);
+      free(tus);
+      free(sizes);
+      fclose(fp);
+      return 1;
+    }
+    if (fread(tus[cnt], 1, sz, fp) != sz) {
+      free(tus[cnt]);
+      break;
+    }
     sizes[cnt++] = sz;
+  }
+  if (!cnt) {
+    fprintf(stderr, "no frames in %s\n", argv[1]);
+    free(tus);
+    free(sizes);
+    fclose(fp);
+    return 1;
   }
   CFDataRef av1C = make_av1C(tus[0], sizes[0]);
   if (!av1C) {
     fprintf(stderr, "no sequence header in first TU\n");
+    for (size_t i = 0; i < cnt; i++) free(tus[i]);
+    free(tus);
+    free(sizes);
+    fclose(fp);
     return 1;
   }
   const void* ak[] = {CFSTR("av1C")};
