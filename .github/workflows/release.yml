@@ -50,6 +50,9 @@ jobs:
           file "$app/Contents/Resources/AV1VCNDecoder.bundle/Contents/MacOS/AV1VCNDecoder" | grep -q x86_64
           file "$app/Contents/Resources/VP9VCNDecoder.bundle/Contents/MacOS/VP9VCNDecoder" | grep -q x86_64
           file "$app/Contents/MacOS/VCNInstaller" | grep -q x86_64
+          file "$app/Contents/Resources/VCNEncodeFix/bin/vcnencodefix" | grep -q x86_64
+          (cd "$app/Contents/Resources/VCNEncodeFix" && shasum -a 256 -c -s SHA256SUMS)
+          zsh -n "$app/Contents/Resources/encode-engine.sh"
           codesign --verify --deep --strict "$app"
 
       - name: Package DMG and checksum

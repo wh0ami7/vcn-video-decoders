@@ -67,6 +67,7 @@ static void write_png(const char* dir, int number, IOSurfaceRef s, uint32_t w,
          uvs = IOSurfaceGetBytesPerRowOfPlane(s, 1);
   uint32_t ow = w / 2, oh = h / 2;
   uint8_t* rgb = malloc((size_t)ow * oh * 4);
+  if (!rgb) return;
   for (uint32_t r = 0; r < oh; r++)
     for (uint32_t i = 0; i < ow; i++) {
       int Y, U, V;
@@ -139,6 +140,10 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const VP9Parser* p,
   CC_MD5_Init(&m);
   uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
   uint8_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    return;
+  }
   for (uint32_t r = 0; r < h; r++) {
     if (ten) {
       uint16_t *src = (uint16_t*)(y + r * ys), *dst = (uint16_t*)row;

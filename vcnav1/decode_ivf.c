@@ -50,6 +50,10 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const AV1Parser* p,
   CC_MD5_Init(&m);
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
   uint8_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
+    return;
+  }
   for (int r = 0; r < h; r++) {
     if (ten) {  // P010 -> little-endian 16-bit samples (value in low 10 bits)
       uint16_t *src = (uint16_t*)(y + r * ys), *dst = (uint16_t*)row;

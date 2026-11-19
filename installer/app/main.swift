@@ -20,8 +20,9 @@ struct Preflight: Decodable {
   let checks: [Check]
 }
 
-enum Confirm: Identifiable {
+enum Confirm: Identifiable, Hashable {
   case install, installAnyway, uninstall, reboot, repair
+  case encode(EncodeConfirm)
   var id: Int { hashValue }
 }
 
@@ -202,6 +203,7 @@ struct CheckRow: View {
 
 struct ContentView: View {
   @StateObject var engine = Engine()
+  @StateObject var enc = EncodeEngine()
   @State private var confirm: Confirm? = nil
 
   var installed: String { engine.pre?.installed ?? "none" }
@@ -220,33 +222,54 @@ struct ContentView: View {
     VStack(spacing: 0) {
       header
       Divider()
-      ScrollView {
-        VStack(alignment: .leading, spacing: 0) {
-          if engine.pre != nil && !engine.needReboot { stateBanner.padding(.horizontal, 20) }
-          Text("PREFLIGHT").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
-            .padding(.top, 16).padding(.horizontal, 20)
-          if let pre = engine.pre {
-            VStack(spacing: 0) {
-              ForEach(pre.checks) { c in
-                CheckRow(c: c)
-                if c.id != pre.checks.last?.id { Divider().padding(.leading, 54) }
+      ScrollViewReader { proxy in
+        ScrollView {
+          VStack(alignment: .leading, spacing: 0) {
+            if engine.pre != nil && !engine.needReboot { stateBanner.padding(.horizontal, 20) }
+            Text("PREFLIGHT").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary)
+              .padding(.top, 16).padding(.horizontal, 20)
+            if let pre = engine.pre {
+              VStack(spacing: 0) {
+                ForEach(pre.checks) { c in
+                  CheckRow(c: c)
+                  if c.id != pre.checks.last?.id { Divider().padding(.leading, 54) }
+                }
+              }.padding(.horizontal, 20).padding(.vertical, 6)
+            } else {
+              HStack {
+                ProgressView().controlSize(.small)
+                Text("Checking…").foregroundStyle(.secondary)
+              }.padding(20)
+            }
+            resultBanner.padding(.horizontal, 20)
+            Divider().padding(.top, 16)
+            EncodeSection(
+              enc: enc,
+              banner: encodeBanner,
+              ask: { confirm = .encode($0) },
+              onExpand: {
+                // The section sits below the fold: bring it into view after the expand animation.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                  withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo("encode", anchor: .top)
+                  }
+                }
               }
-            }.padding(.horizontal, 20).padding(.vertical, 6)
-          } else {
-            HStack {
-              ProgressView().controlSize(.small)
-              Text("Checking…").foregroundStyle(.secondary)
-            }.padding(20)
+            ).id("encode").padding(.horizontal, 20).padding(.vertical, 12)
           }
-          resultBanner.padding(.horizontal, 20)
         }
       }
       Divider()
       footer
       credit
-    }.frame(width: 560, height: 700).onAppear { engine.recheck() }.alert(item: $confirm) { c in
-      alert(for: c)
-    }
+    }.frame(width: 560, height: 740).onAppear {
+      enc.onNeedReboot = { engine.needReboot = true }
+      engine.recheck()
+    }.alert(item: $confirm) { c in alert(for: c) }
+  }
+
+  func encodeBanner(_ icon: String, _ color: Color, _ text: String) -> AnyView {
+    AnyView(banner(icon: icon, color: color, text: text))
   }
 
   @ViewBuilder var stateBanner: some View {
@@ -298,6 +321,7 @@ struct ContentView: View {
 
   func alert(for c: Confirm) -> Alert {
     switch c {
+    case .encode(let e): return EncodeSection.alert(for: e, enc: enc)
     case .install:
       return Alert(
         title: Text("Install the hardware decoders?"),
@@ -407,6 +431,7 @@ struct ContentView: View {
     HStack(spacing: 12) {
       Button {
         engine.recheck()
+        enc.recheck()
       } label: {
         Label("Re-check", systemImage: "arrow.clockwise")
       }.disabled(busy)
@@ -459,6 +484,311 @@ struct ContentView: View {
     case "current": return "Installed"
     case "outdated": return "Update"
     default: return "Install"
+    }
+  }
+}
+
+// MARK: - Optional encoding fix (VCNEncodeFix)
+
+struct EncodeEFI: Identifiable, Decodable, Hashable {
+  let id: String  // diskNsM
+  let name: String
+  let media: String
+  let mounted: Bool
+  let mountPoint: String
+  let openCore: String  // yes | no | unknown (unknown = not mounted)
+  let entry: String  // yes | no | unknown: VCNEncodeFloor.kext listed in its config.plist
+  let kext: String  // current | outdated | missing | unknown
+
+  var title: String {
+    var s = "\(id) — \(name) on \(media)"
+    if openCore == "yes" {
+      switch (entry, kext) {
+      case ("yes", "outdated"): s += " (OpenCore, older kext installed)"
+      case ("yes", _): s += " (OpenCore, kext installed)"
+      default: s += " (OpenCore)"
+      }
+    }
+    if openCore == "no" { s += " (no OpenCore)" }
+    return s
+  }
+}
+
+struct EncodePreflight: Decodable {
+  let canInstall: Bool
+  let version: String
+  let installed: String  // none | current | outdated
+  let service: String  // none | running | stopped
+  let kext: String  // "not loaded" | "loaded 1.0.0, active: encode" ...
+  let efis: [EncodeEFI]
+  let checks: [Check]
+}
+
+final class EncodeEngine: ObservableObject {
+  @Published var pre: EncodePreflight? = nil
+  @Published var phase: Phase = .idle
+  var onNeedReboot: () -> Void = {}
+
+  private var resDir: String {
+    Bundle.main.resourcePath ?? FileManager.default.currentDirectoryPath
+  }
+  private var enginePath: String { resDir + "/encode-engine.sh" }
+
+  func recheck() {
+    phase = .checking
+    DispatchQueue.global().async {
+      let p = Process()
+      p.executableURL = URL(fileURLWithPath: "/bin/zsh")
+      p.arguments = [self.enginePath, "check", "--res", self.resDir]
+      let pipe = Pipe()
+      p.standardOutput = pipe
+      p.standardError = Pipe()
+      var out = Data()
+      if (try? p.run()) != nil {
+        out = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+      }
+      let pre = try? JSONDecoder().decode(EncodePreflight.self, from: out)
+      DispatchQueue.main.async {
+        self.pre = pre
+        self.phase = pre == nil ? .failed("Could not read the encoding fix preflight.") : .idle
+      }
+    }
+  }
+
+  static func isEFIId(_ s: String) -> Bool {
+    s.range(of: "^disk[0-9]+s[0-9]+$", options: .regularExpression) != nil
+  }
+
+  /// Runs `cmd` (install or uninstall); `efi` nil means the service only.
+  func run(_ cmd: String, efi: String?) {
+    if let efi, !Self.isEFIId(efi) {
+      phase = .failed("Bad EFI partition name.")
+      return
+    }
+    phase = cmd == "install" ? .installing : .uninstalling
+    DispatchQueue.global().async {
+      var inner = "/bin/zsh \(Engine.shq(self.enginePath)) \(cmd) --res \(Engine.shq(self.resDir))"
+      if let efi { inner += " --efi \(efi)" }
+      let (ok, msg) = self.runPrivileged(inner)
+      DispatchQueue.main.async {
+        if ok {
+          if efi != nil { self.onNeedReboot() }
+          self.phase = .done(
+            cmd == "install"
+              ? (efi != nil
+                ? "Encoding fix installed. The service works now; reboot to load the clock-floor kext."
+                : "Encoding fix service installed and running. No reboot needed.")
+              : (efi != nil
+                ? "Encoding fix removed, kext included. Reboot to unload the kext."
+                : "Encoding fix service removed. Apps that are open keep the fix until you quit them.")
+          )
+        } else {
+          self.phase = .failed(msg)
+        }
+        self.recheck()
+      }
+    }
+  }
+
+  private func runPrivileged(_ inner: String) -> (Bool, String) {
+    if Engine.isUnsafePath(enginePath) || Engine.isUnsafePath(resDir) {
+      return (false, "Installer path contains unsafe characters.")
+    }
+    let src = "do shell script \"\(Engine.asq(inner))\" with administrator privileges"
+    let s = NSAppleScript(source: src)
+    var err: NSDictionary?
+    let r = s?.executeAndReturnError(&err)
+    if let err = err {
+      let m =
+        (err[NSAppleScript.errorMessage] as? String)
+        ?? "Authorization failed or the install was cancelled."
+      return (false, m)
+    }
+    return (true, r?.stringValue ?? "")
+  }
+}
+
+/// What the encoding fix asks to confirm.
+///
+/// ContentView presents it: on macOS an .alert in a child view does not show while the window's root
+/// view has its own .alert.
+enum EncodeConfirm: Hashable {
+  case install(EncodeEFI?)  // nil = service only
+  case uninstall(EncodeEFI?)
+}
+
+struct EncodeSection: View {
+  @ObservedObject var enc: EncodeEngine
+  let banner: (String, Color, String) -> AnyView
+  let ask: (EncodeConfirm) -> Void
+  var onExpand: () -> Void = {}
+  @State private var expanded = false
+  @State private var target = ""  // "" = service only, else an EFI id
+
+  var busy: Bool {
+    switch enc.phase {
+    case .checking, .installing, .uninstalling: return true
+    default: return false
+    }
+  }
+  var installed: String { enc.pre?.installed ?? "none" }
+  var targetEFI: EncodeEFI? { enc.pre?.efis.first { $0.id == target } }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 0) {
+      // The whole header row toggles the section, not only the disclosure arrow.
+      Button {
+        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+        if expanded { onExpand() }
+      } label: {
+        HStack(spacing: 6) {
+          Image(systemName: "chevron.right").font(.system(size: 10, weight: .bold)).rotationEffect(
+            .degrees(expanded ? 90 : 0)
+          )
+          Text("ENCODING FIX (OPTIONAL)\(enc.pre.map { " — VCNEncodeFix \($0.version)" } ?? "")")
+            .font(.system(size: 11, weight: .bold))
+          Spacer(minLength: 0)
+        }.foregroundStyle(.secondary).padding(.vertical, 6).contentShape(Rectangle())
+      }.buttonStyle(.plain).accessibilityAddTraits(.isHeader).accessibilityValue(
+        expanded ? "expanded" : "collapsed"
+      )
+      if expanded {
+        VStack(alignment: .leading, spacing: 8) {
+          Text(
+            "Separate from the decoders and off unless you install it here. Fixes slow or stuttering hardware HEVC/H.264 recording on Navi 21 (OBS 4K60 and larger, widths above 4096). A small background service patches the encoder in memory; an optional kext in your OpenCore EFI keeps the video engine at full clock while encoding. Nothing is written to the system volume."
+          ).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(
+            horizontal: false,
+            vertical: true
+          )
+          if let pre = enc.pre {
+            VStack(spacing: 0) {
+              ForEach(pre.checks) { c in
+                CheckRow(c: c)
+                if c.id != pre.checks.last?.id { Divider().padding(.leading, 34) }
+              }
+            }
+            statusLine("Service", serviceText(pre))
+            statusLine("Clock-floor kext", pre.kext)
+            Picker("Install to", selection: $target) {
+              Text("Service only (no reboot)").tag("")
+              ForEach(pre.efis) { e in Text(e.title).tag(e.id) }
+            }.pickerStyle(.menu).font(.system(size: 12))
+            Text(targetHint).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(
+              horizontal: false,
+              vertical: true
+            )
+            HStack {
+              Spacer()
+              Button(role: .destructive) {
+                ask(.uninstall(targetEFI))
+              } label: {
+                Text("Remove")
+              }.disabled(busy || (installed == "none" && target.isEmpty))
+              Button {
+                ask(.install(targetEFI))
+              } label: {
+                Text(installLabel).bold().frame(minWidth: 90)
+              }.buttonStyle(.borderedProminent).disabled(
+                busy || !pre.canInstall || (installed == "current" && target.isEmpty)
+              )
+            }
+          } else {
+            HStack {
+              ProgressView().controlSize(.small)
+              Text("Checking…").foregroundStyle(.secondary)
+            }
+          }
+          resultBanner
+        }.padding(.top, 6)
+      }
+    }.onAppear { enc.recheck() }
+  }
+
+  func serviceText(_ pre: EncodePreflight) -> String {
+    switch (pre.installed, pre.service) {
+    case ("none", _): return "not installed"
+    case (_, "running"):
+      return pre.installed == "current" ? "running, up to date" : "running, older version"
+    default: return "installed but not running"
+    }
+  }
+
+  var targetHint: String {
+    guard let e = targetEFI else {
+      return
+        "Installs or updates only the service: the speed preset and the fix for widths above 4096. The kext is left as it is."
+    }
+    var s =
+      "Also copies VCNEncodeFloor.kext to \(e.id)/EFI/OC/Kexts and adds one entry to its config.plist (a dated backup is saved next to it). Pick the EFI partition your Mac boots OpenCore from"
+    s += e.mounted ? "." : "; it will be mounted for the change and unmounted again."
+    if e.openCore == "no" { s += " This partition has no OpenCore: the install will refuse it." }
+    return s
+  }
+
+  var installLabel: String {
+    if busy { return "Working…" }
+    if targetEFI != nil { return "Install with kext" }
+    switch installed {
+    case "current": return "Installed"
+    case "outdated": return "Update"
+    default: return "Install"
+    }
+  }
+
+  func statusLine(_ k: String, _ v: String) -> some View {
+    HStack(spacing: 6) {
+      Text(k).font(.system(size: 12, weight: .semibold))
+      Text(v).font(.system(size: 12)).foregroundStyle(.secondary)
+      Spacer(minLength: 0)
+    }
+  }
+
+  @ViewBuilder var resultBanner: some View {
+    switch enc.phase {
+    case .done(let m): banner("checkmark.seal.fill", .green, m)
+    case .failed(let m): banner("exclamationmark.triangle.fill", .red, m)
+    case .installing:
+      banner(
+        "gearshape.fill",
+        .blue,
+        "Installing the encoding fix… enter your password when asked."
+      )
+    case .uninstalling: banner("trash.fill", .blue, "Removing the encoding fix…")
+    default: EmptyView()
+    }
+  }
+
+  static func alert(for c: EncodeConfirm, enc: EncodeEngine) -> Alert {
+    switch c {
+    case .install(let efi):
+      let efiID = efi?.id ?? ""
+      let efiName = efi?.name ?? ""
+      return Alert(
+        title: Text(
+          efi == nil
+            ? "Install the encoding fix service?" : "Install the encoding fix with the kext?"
+        ),
+        message: Text(
+          efi == nil
+            ? "Installs a background service (com.droga.vcnencodefix) that patches the hardware encoder of apps such as OBS in memory. It works right away. macOS will ask for your password."
+            : "Installs the service and adds VCNEncodeFloor.kext to the OpenCore EFI on \(efiID) (\(efiName)). config.plist is backed up first and checked after the change. Keep a USB stick with a bootable EFI in case the Mac does not start. Reboot afterwards."
+        ),
+        primaryButton: .default(Text("Install")) { enc.run("install", efi: efi?.id) },
+        secondaryButton: .cancel()
+      )
+    case .uninstall(let efi):
+      let efiID = efi?.id ?? ""
+      return Alert(
+        title: Text("Remove the encoding fix?"),
+        message: Text(
+          efi == nil
+            ? "Removes the background service. The kext, if you installed it, stays in your EFI: pick that EFI above to remove it too."
+            : "Removes the service, VCNEncodeFloor.kext and its config.plist entry from \(efiID) (with a backup). Reboot afterwards."
+        ),
+        primaryButton: .destructive(Text("Remove")) { enc.run("uninstall", efi: efi?.id) },
+        secondaryButton: .cancel()
+      )
     }
   }
 }

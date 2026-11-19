@@ -30,6 +30,24 @@ It also detects whether the decoders are already installed and up to date (cdhas
 offers **Update** or **Uninstall** accordingly. Undo everything: **Uninstall** + reboot, or
 `sudo bless --mount / --last-sealed-snapshot` + reboot.
 
+### Encoding fix (optional)
+
+Below the decoder checks, a collapsed **Encoding fix (optional)** section installs VCNEncodeFix (see
+`../vcnencodefix/README.md`). It has its own checks and buttons and does not depend on the decoders:
+
+| Check | Why it matters |
+|---|---|
+| Encoding fix package present | the app was unzipped intact |
+| macOS build validated for encoding | the fix patches exact Apple and AMD binaries; only builds with `"encode": true` |
+| Encoder files match | the service found the exact code it patches (speed preset, >4096-wide fix) |
+| Navi 21 GPU | VCNEncodeFix is only for Navi 21 |
+| Lilu loaded | warning only; needed by the clock-floor kext, not by the service |
+
+**Install to** picks what is installed: *Service only* (works at once, no reboot) or one of the Mac's EFI
+partitions, which also adds `VCNEncodeFloor.kext` to that OpenCore EFI (the partition is mounted if needed and
+unmounted again; it must hold `EFI/OC/OpenCore.efi`, `config.plist` and `Lilu.kext`; `config.plist` gets a dated
+backup and is checked after the edit). **Remove** undoes the same scope.
+
 ## Why /System and not /Library
 
 VideoToolbox scans `/System/Library/Video/Plug-Ins` without a code-signature check. `/Library/Video/Plug-Ins`
@@ -41,10 +59,14 @@ Tahoe: Lilu's userspace patcher cannot patch the split dyld shared cache (see `.
 - `engine.sh` — all logic: `check` (JSON preflight, no root), `install [--force]`, `repair [--force]`,
   `uninstall` (root). Deletions are guarded: only the two decoder bundle paths can ever be removed.
   The app is a thin SwiftUI shell around it; the CLI works the same: `sudo ./engine.sh install`.
+- `encode-engine.sh` — the encoding fix: `check` (JSON, no root), `install [--efi diskNsM]`,
+  `uninstall [--efi diskNsM]` (root). It wraps VCNEncodeFix's own `install.sh` / `uninstall.sh`.
 - `validated-builds.json` — macOS builds whose driver was validated. Add a build only after
-  validating its AMDRadeonVADriver2 (AV1 + VP9 paths) in IDA.
+  validating its AMDRadeonVADriver2 (AV1 + VP9 paths) in IDA. `encode: true` only after VCNEncodeFix
+  supports that build (its tool checks the exact UUIDs and bytes it patches).
 - `build-app.sh` — builds `build/AMD VCN Video Decoders.app` from `../vtav1/build` and
   `../vtvp9/build`. Embedded bundles keep their original cdhashes (only the outer app is re-signed).
+  VCNEncodeFix comes from `../vcnencodefix/dist` or else `../vcnencodefix/prebuilt/*.zip`.
 - `make-dmg.sh` — packages the app into `build/AMD-VCN-Video-Decoders-<version>.dmg`.
 - `make-assets.sh` — renders the app icon and the DMG background from `assets/render.swift`.
 - `VCNVT_FAKE_BUILD=<build>` makes the preflight pretend another macOS build (testing the blocked path).

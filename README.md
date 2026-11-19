@@ -3,6 +3,9 @@
 Hardware AV1 and VP9 decoding through VideoToolbox on AMD Navi 21 GPUs (RX 6800, 6800 XT, 6900 XT,
 6950 XT) on OpenCore hackintoshes. Safari and Chrome then decode YouTube AV1 and VP9 on the GPU.
 
+The installer also offers an optional encoding fix (VCNEncodeFix) for slow or stuttering hardware HEVC/H.264
+recording, for example OBS at 4K60 or wider than 4096. See "Encoding fix (optional)" below.
+
 Made by [DrogaBox](https://github.com/DrogaBox) & [Izzy](https://github.com/wh0ami7).
 
 <img width="1900" height="859" alt="image" src="https://github.com/user-attachments/assets/a58ecd9d-c990-4707-aea9-8a3f5d1fe01e" />
@@ -32,6 +35,41 @@ decode messages and submit them through the driver, then hand the frames back to
 VP9 is not in Apple's driver at all. `vcnvp9` builds the VCN VP9 messages itself, following the
 same layout as Mesa's `ac_vcn_dec.h`.
 
+## Encoding fix (optional)
+
+macOS's hardware encoder leaves three things wrong on Navi 21: the video engine is never asked for clocks and
+can stay at its lowest speed for a whole recording, no speed preset is ever selected, and every HEVC frame wider
+than 4096 runs a small GPU job with more threads per group than the GPU allows, which stalls it.
+**VCNEncodeFix 1.2.2** fixes all three with a background service (patches the encoder process in memory, no reboot)
+and an optional Lilu kext in the OpenCore EFI (clock floor while encoding). It never touches the system volume.
+
+It is separate from the decoders: the installer shows it in its own collapsed section, with its own checks
+(including an "Access to the encoder process" line) and Install/Remove buttons, and installs nothing unless asked.
+It is enabled on Sequoia 15.8.2 (24H232) and 15.8.3 (24H241) and Tahoe 26.7.3 (25G342)
+(`"encode": true` in `installer/validated-builds.json`).
+
+Requirements and behaviour that matter in 1.2.x:
+
+- The service needs SIP's **Debugging Restrictions** off (bit `0x4` of `csr-active-config`, for example
+  `03080000` becomes `07080000`). With them on, macOS refuses root `task_for_pid` on the encoder process, so the
+  service patches nothing; the installer shows a warning and the clock-floor kext still works.
+- OpenCore kext entries use **MinKernel 23.0.0** (Sonoma through Tahoe). Older installs that wrote `25.0.0`
+  (Tahoe only) skip the kext on Sequoia; run Install again on the EFI to rewrite that one line (with a backup).
+- The service runs as launchd **Interactive** and re-checks spawning pids every 10 ms so a new encoder is patched
+  before the first wide HEVC frame under CPU load.
+
+Results so far: only Tahoe 26.7.3 has been measured on a GPU here (RX 6800 XT, OBS 33) — HEVC 4K60 from 55 %
+repeated frames to 0.3 %, 3840x4320@30 from about 10 fps to real time, 5120x2160@30 from GPU stalls to real time.
+On Sequoia the patched sites were checked in IDA (15.8.2 and 15.8.3 share the same encoder binaries) and the wide
+patch CPU test covers all three plug-in builds. One user on 15.8.3 with an RX 6900 XT and NootRX reported, with the
+standalone package: HEVC 60 fps exports at 4K from 72 to 99 fps, 5120x2880 from 40 fps with 5–10 s hangs to 58 fps
+with none, and 7680x2160 from glitches that needed a reboot to 52 fps. The kext hooks either Navi 21 power library
+(`AMDRadeonX6000HWLibs` or `AMDRadeonX6800HWLibs`), so NootRX setups are covered in code (load on that user's Mac
+was not confirmed).
+
+Details, limits and the command-line install are in `vcnencodefix/README.md`. Version history is in
+`vcnencodefix/CHANGELOG.md`.
+
 ## Layout
 
 | Folder | What it is |
@@ -41,6 +79,7 @@ same layout as Mesa's `ac_vcn_dec.h`.
 | `vtav1/` | `AV1VCNDecoder.bundle`, the VideoToolbox plug-in for `av01`. `vtav1test` drives it through the public VT API |
 | `vtvp9/` | `VP9VCNDecoder.bundle`, the VideoToolbox plug-in for `vp09`. `vtvp9test` drives it through the public VT API |
 | `installer/` | The graphical installer app and its shell engine. See `installer/README.md` |
+| `vcnencodefix/` | The optional encoding fix (VCNEncodeFix): kext, service, scripts, tests. `prebuilt/` holds the built package the installer embeds |
 | `vcnvtkext/` | Lilu kext to load the plug-ins from `/Library` instead of `/System`. Experimental, see Status |
 | `vcnprofilekext/` | Lilu kext that switches the GPU to the VIDEO workload profile. Measurement tool, see Status |
 | `tools/` | Reverse-engineering helpers (lldb dry runs, symbol and struct tools). They need Apple binaries that are not included |
@@ -74,6 +113,12 @@ KEXT_SDK=/path/to/sdk ./vcnvtkext/build.sh
 
 `KEXT_SDK` must contain `Lilu.kext` (a build that ships `Contents/Resources/Headers` and `Library`)
 and a `MacKernelSDK` checkout.
+
+VCNEncodeFix builds the same way (`KEXT_SDK=/path/to/sdk ./vcnencodefix/build.sh`, writes
+`vcnencodefix/dist/`), and `build-app.sh` prefers that build. Without it, `build-app.sh` uses the checked-in
+`vcnencodefix/prebuilt/VCNEncodeFix-<version>.zip` (after checking its SHA256SUMS), which is what the release CI
+does. To refresh the prebuilt zip after a change: `./vcnencodefix/build.sh && ./vcnencodefix/export.sh .`
+(from a VCNEncodeFix checkout of its own, `./export.sh <this repo>`).
 
 A bundle you build yourself has a different cdhash from the one in the released DMG, even when the
 machine code is identical: the symbol table's debug map records the build folder and the object
@@ -133,6 +178,9 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
 - `vcnprofilekext`: the firmware accepted the VIDEO profile, but speed and power didn't change.
 - `vcnvtkext`: the AMFI part works. The CoreMedia patch doesn't land on Tahoe because Lilu can't
   patch the split dyld shared cache, so the installer writes to `/System` instead.
+- VCNEncodeFix 1.2.2: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
+  Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures). Full kext package build still needs
+  `KEXT_SDK` (Lilu + MacKernelSDK); without it the installer embeds `vcnencodefix/prebuilt/`.
 
 ## Checking support
 
@@ -145,7 +193,8 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
   The `tools/` scripts expect you to supply those from your own install.
 - Test videos for `webtest/` and the conformance vectors. The AV1 vectors come from the AOM test
   suite, and the VP9 references from FFmpeg FATE (`tests/ref/fate/vp9-*`).
-- Build output. Run the build scripts.
+- Build output. Run the build scripts. The one exception is `vcnencodefix/prebuilt/`, because the release CI
+  has no Lilu/MacKernelSDK to build the kext.
 
 ## Third-party code
 

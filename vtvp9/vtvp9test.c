@@ -366,6 +366,13 @@ int main(int argc, char** argv) {
   if (pace > 0) {
     c.fed = calloc(total, sizeof(double));
     c.lat = calloc(total, sizeof(double));
+    if (!c.fed || !c.lat) {
+      free(c.fed);
+      free(c.lat);
+      c.fed = c.lat = NULL;
+      fprintf(stderr, "out of memory\n");
+      return 1;
+    }
   }
   double t0 = now_ms();
   size_t fed = 0;
