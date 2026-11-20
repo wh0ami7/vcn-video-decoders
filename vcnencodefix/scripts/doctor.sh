@@ -9,7 +9,9 @@ installed=/usr/local/libexec/vcnencodefix
 plist=/Library/LaunchDaemons/com.droga.vcnencodefix.plist
 tool=$installed
 [[ -x $tool ]] || tool=$here/bin/vcnencodefix
-xattr -dr com.apple.quarantine $here 2>/dev/null
+# sudo keeps the caller's PATH on macOS: only the system's own tools, whatever is in it
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+xattr -drs com.apple.quarantine $here 2>/dev/null
 say() { print -r -- "$@"; }
 
 say "VCNEncodeFix $(cat $here/VERSION 2>/dev/null || echo '?') doctor, $(date '+%Y-%m-%d %H:%M')"

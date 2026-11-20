@@ -23,7 +23,9 @@ while (( $# )); do
   esac
 done
 (( EUID == 0 )) || die "run it with sudo: sudo $0"
-xattr -dr com.apple.quarantine $here 2>/dev/null
+# sudo keeps the caller's PATH on macOS: only the system's own tools, whatever is in it
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+xattr -drs com.apple.quarantine $here 2>/dev/null
 
 # what --efi needs is checked before anything is removed
 if [[ -n $efi ]]; then

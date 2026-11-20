@@ -12,6 +12,7 @@
 #include "ocentry.h"
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <fcntl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,9 +61,18 @@ static int write_file(const char* path, const void* p, size_t n) {
     fprintf(stderr, "%s: path too long\n", path);
     return -1;
   }
-  FILE* f = fopen(tmp, "wb");
+  // Made new: whatever is at that name (a leftover, or a link someone planted)
+  // is removed first, and O_EXCL never follows a link, so root writes only its
+  // own file.
+  unlink(tmp);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  FILE* f = fd < 0 ? NULL : fdopen(fd, "wb");
   if (!f) {
     perror(tmp);
+    if (fd >= 0) {
+      close(fd);
+      unlink(tmp);
+    }
     return -1;
   }
   size_t w = fwrite(p, 1, n, f);

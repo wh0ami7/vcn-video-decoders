@@ -42,7 +42,9 @@ done
 (( EUID == 0 )) || die "run it with sudo: sudo $0"
 
 # Files unpacked from a downloaded zip carry the quarantine flag, which stops unsigned tools from running.
-xattr -dr com.apple.quarantine $here 2>/dev/null
+# sudo keeps the caller's PATH on macOS: only the system's own tools, whatever is in it
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+xattr -drs com.apple.quarantine $here 2>/dev/null
 [[ -x $tool ]] || die "$tool is missing; unpack the whole folder"
 
 step "Checking this Mac"

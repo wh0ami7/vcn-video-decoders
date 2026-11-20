@@ -2,6 +2,9 @@
 
 ## 1.2.3 (not released)
 
+- Scripts: `install.sh`, `uninstall.sh`, `doctor.sh` and `test.sh` run the system's own tools only (`PATH`
+  set), whatever PATH sudo kept, and clear the quarantine flag with `xattr -s` so a link in the package does
+  not make root clear it on the link's target.
 - Kext: the log of the first 32 floored requests now takes its slot atomically, so two encode sessions at once
   cannot go past the cap.
 - Tool: `patch <pid>` and `--interval` refuse anything that is not a whole number (atoi read `abc` as 0). The

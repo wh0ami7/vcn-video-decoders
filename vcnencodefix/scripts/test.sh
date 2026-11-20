@@ -21,7 +21,9 @@ case ${1:-} in
 esac
 (( $# <= 1 )) || { print -u2 "one option at most (see --help)"; exit 64; }
 (( EUID != 0 )) || { print "run it as yourself, not with sudo"; exit 1; }
-xattr -dr com.apple.quarantine $here 2>/dev/null
+# sudo keeps the caller's PATH on macOS: only the system's own tools, whatever is in it
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+xattr -drs com.apple.quarantine $here 2>/dev/null
 [[ -x $vtenc ]] || { print -u2 "$vtenc is missing; unpack the whole folder"; exit 1; }
 mkdir -p $here/reports || { print -u2 "cannot create $here/reports"; exit 1; }
 report=$here/reports/test-$(date +%Y%m%d-%H%M%S).txt
