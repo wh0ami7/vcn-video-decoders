@@ -51,7 +51,7 @@ step "Checking this Mac"
 gpu=$(system_profiler SPDisplaysDataType 2>/dev/null | awk -F': ' '/Chipset Model/{m=$2} /Device ID/{print m" ("$2")"}')
 say "GPU: ${gpu:-unknown}"
 if ! print -r -- $gpu | grep -qiE '\(0x73(a[0-9a-f]|bf)\)'; then
-  (( force )) || die "no Navi 21 GPU (RX 6800, 6800 XT, 6900 XT, 6950 XT) found; VCNEncodeFix was only tested on Navi 21. --force skips this check."
+  (( force )) || die "no Navi 21 GPU (RX 6800, 6800 XT, 6900 XT, 6950 XT) found; VCNEncodeFix was only tested on Navi 21. On the RX 6600 family (Navi 23) the kext sets a floor taken from that chip's clock table, but nothing has run there; on other cards the kext stays off. --force skips this check."
   say "warning: no Navi 21 GPU found; continuing because of --force"
 fi
 status_out=$($tool status ${args[@]})

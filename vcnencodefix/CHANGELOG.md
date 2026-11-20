@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.2.4 (not released)
+
+- The kext sets the clock floor only on chips whose video clock levels were read, so the
+  floor stays inside them. The same driver family runs chips whose top levels are below
+  the floor (an RX 5600 XT table: VCLK 1267, DCLK 1086 MHz, against 1322 and 1225), and
+  1.2.3 sent it to every chip. Now:
+  - Navi 21 (device-id 0x73A0 to 0x73AF, 0x73BF): 132297 as before. This Mac's own
+    table (`PP_PhmSoftPowerPlayTable`) has VCLK 363/1400 and DCLK 317/1225 MHz.
+  - Navi 23, the RX 6600 family (0x73E0 to 0x73EF, 0x73FF): the same value, which lands
+    inside its levels: two published RX 6600 XT tables have VCLK 690/1429 and DCLK
+    572/1250 MHz. Not run on a card; the state says so.
+  - Any other AMD GPU (RX 5000, Navi 22): off, unless `vcnfloor=N` is on the boot
+    arguments, which is taken as the user's own value. When Lilu cannot list the GPUs, it
+    works as before.
+- The chip rule is in `kext/floor_logic.hpp`; `tests/floor_test.cpp` checks it against
+  every AMD 0x73xx device-id in pci.ids (0x73F0 is Navi 33, not Navi 23) and the floor
+  against each table's levels.
+- The installers still stop on a card that is not a Navi 21; their message now says what
+  the kext does on Navi 23.
+- Booted on an RX 6800 XT (26.7.3): state "active: encode", `test.sh` 102 fps (preset) and
+  p50 21.3 ms (floor), the same as 1.2.3. Not run on a Navi 23.
+
 ## 1.2.3 (not released)
 
 - Scripts: `install.sh`, `uninstall.sh`, `doctor.sh` and `test.sh` run the system's own tools only (`PATH`

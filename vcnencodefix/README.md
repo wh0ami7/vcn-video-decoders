@@ -1,6 +1,8 @@
 # VCNEncodeFix
 
-Faster, glitch-free HEVC/H.264 hardware encoding on AMD Navi 21 GPUs (RX 6800, 6800 XT, 6900 XT, 6950 XT) in macOS
+Faster, glitch-free HEVC/H.264 hardware encoding on AMD Navi 21 GPUs (RX 6800, 6800 XT,
+6900 XT; RX 6950 XT and RX 6900 XT XTXH are also expected to work when OpenCore presents
+them as `0x73BF`, never run) in macOS
 hackintoshes with OpenCore. Fixes the slow or stuttering OBS recordings at 4K60 and above.
 
 macOS's hardware encoder for AMD leaves three things wrong on these cards:
@@ -33,17 +35,25 @@ the file has every frame, but those are duplicates. That number is the one to wa
   checks the exact build of the Apple file it changes and stays off on any other build, so a macOS update cannot break
   anything; it only switches the fix off until a new version supports it.
 - OpenCore with **Lilu 1.7.0 or newer** (for the kext).
-- For the service: SIP's **Debugging Restrictions off**, i.e. bit `0x4` (`CSR_ALLOW_TASK_FOR_PID`) set in
-  `csr-active-config`. The service patches Apple's encoder process the way a debugger does, and macOS refuses that
-  even to root while this restriction is on: the log then shows `task_for_pid failed ((os/kern) failure)` and
-  `vcnencodefix status` says `access REFUSED`. Check with `csrutil status`. In OpenCore, add `0x4` to the first byte
-  of your current value under NVRAM > Add > `7C436110-AB2A-4BBB-A880-FE41995C9F82` (for example `03080000` becomes
-  `07080000`; `67080000` and `FF0F0000` already have it), make sure `csr-active-config` is also listed under NVRAM >
-  Delete for that GUID (or reset NVRAM once), and reboot. The trade-off: root processes can then attach to system
-  processes, as debuggers and dtrace do. The kernel half does not need this.
+- For the service: **SIP Debugging Restrictions** off (bit `0x4`, `CSR_ALLOW_TASK_FOR_PID`,
+  in `csr-active-config`). The service patches Apple's encoder process the way a debugger
+  does, and macOS refuses that even to root while this restriction is on: the log then
+  shows `task_for_pid failed ((os/kern) failure)` and `vcnencodefix status` says
+  `access REFUSED`. Check with `csrutil status`. To change it in OpenCore:
+  1. Under `NVRAM > Add > 7C436110-AB2A-4BBB-A880-FE41995C9F82 > csr-active-config`, add
+     `0x4` to the first byte of your current value (for example `03080000` becomes
+     `07080000`; `67080000` and `FF0F0000` already have it).
+  2. List `csr-active-config` under `NVRAM > Delete` for the same GUID (or reset NVRAM once).
+  3. Reboot.
+
+  The trade-off: root processes can then attach to system processes, as debuggers and
+  dtrace do. The kernel half does not need this.
 - Administrator access (sudo).
 
 ## Install
+
+The installer app of this repository installs it from its "Encoding fix" section. The steps below
+use the package by hand (`VCNEncodeFix-<version>.zip`, or `vcnencodefix/prebuilt/`).
 
 Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into the folder.
 
@@ -68,6 +78,13 @@ Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into th
 
    Keep a way to boot another EFI (a USB stick with your previous EFI) in case something goes wrong; restoring the
    backup over `EFI/OC/config.plist` undoes the change.
+
+### Versions of the two halves
+
+The service and the kext never talk to each other, so any 1.2.x service works with any 1.2.x kext: updating the
+service alone is fine (the service 1.1.0 was installed and tested on the GPU here while the kext was still 1.0.1). A new
+kext only takes effect after a reboot, and every change to its code (1.2.4 is one) has to be booted once before it
+counts as tested.
 
 ## Check that it works
 

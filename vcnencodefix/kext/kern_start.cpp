@@ -29,6 +29,15 @@
 //  as the property "VCNEncodeFloor" on IOResources (ioreg -rd1 -c IOResources |
 //  grep VCNEncodeFloor).
 //
+//  The floor must stay inside each chip's own video clock levels, and the same
+//  driver family also runs chips whose top levels are below it (an RX 5600 XT
+//  table tops out at VCLK 1267 / DCLK 1086 MHz). So requests are changed only
+//  when every AMD GPU in the Mac is a chip whose levels were read (chipFloor):
+//  Navi 21 (device-id 0x73A0-0x73AF, 0x73BF; this Mac's table: VCLK 363/1400,
+//  DCLK 317/1225) and Navi 23 (0x73E0-0x73EF, 0x73FF; two RX 6600 XT tables:
+//  VCLK 690/1429, DCLK 572/1250). Navi 23 has not run on a card. A vcnfloor=N
+//  boot argument is taken as the user's own value and applies to any chip.
+//
 //  Boot args: -vcnflooroff disables it; vcnfloor=N sets the floor (default
 //  132297); -vcnfloorall also changes requests with minMclk 0 (decode);
 //  -vcnfloordbg / -vcnfloorbeta are Lilu's usual debug / beta switches.
@@ -36,17 +45,26 @@
 #include <IOKit/IOService.h>
 #include <mach-o/loader.h>
 
+// Lilu's own headers shadow names in two places (kern_util.hpp, kern_cpu.hpp);
+// the warning is theirs, not this file's.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshadow"
 #include <Headers/kern_api.hpp>
+#include <Headers/kern_devinfo.hpp>
+#include <Headers/kern_iokit.hpp>
 #include <Headers/kern_patcher.hpp>
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
+#pragma clang diagnostic pop
+
+#include "floor_logic.hpp"
 
 // 132297 in 10 kHz units: VCLK soft minimum 1322 MHz, which the firmware rounds
 // up to its 1400 MHz level; the DCLK request of PEM_CWDDEPM_PMRequest is 0, so
 // the DCLK soft minimum is the raw value, of which the SMU message keeps 16
 // bits: 132297 & 0xFFFF = 1225 MHz, the top DCLK level. This exact value was
 // tested; others were not.
-static constexpr uint32_t kDefaultFloor = 132297;
+static constexpr uint32_t kDefaultFloor = vcnfloor::kDefaultFloor;
 static constexpr uint32_t kClientVcn0 = 28;
 static constexpr uint32_t kClientVcn1 = 33;
 static constexpr size_t kPayloadSize =
@@ -108,7 +126,22 @@ static const HWLibsBuild kX6800Builds[]{
 
 static uint32_t gFloor = kDefaultFloor;
 static bool gAllClients = false;
+static bool gFloorGiven = false;  // vcnfloor=N on the boot arguments
 static int gLogs = 0;
+
+// What the GPU check found. Unknown until Lilu's device list is read (and if it
+// cannot be read): then the plugin works as it did before the check.
+enum class Gpus { Unknown, AllKnown, Other };
+static Gpus gGpus = Gpus::Unknown;
+static bool gAnyNavi23 = false;
+static bool gRouted = false;
+
+using vcnfloor::chipFloor;
+using vcnfloor::isNavi23;
+
+static inline bool floorAllowed() {
+  return gGpus != Gpus::Other || gFloorGiven;
+}
 
 static const char* kX6000Paths[]{
     "/System/Library/Extensions/AMDRadeonX6000HWServices.kext/Contents/PlugIns/"
@@ -168,7 +201,7 @@ static int64_t floorPMRequest(t_pmRequest org, void* pem, uint8_t* in,
     uint32_t floor = rd32(in + kOffVclkFloor);
     uint32_t minMclk = rd32(in + kOffMinMclk);
     if ((type == kClientVcn0 || type == kClientVcn1) && floor == 0 &&
-        (minMclk != 0 || gAllClients)) {
+        (minMclk != 0 || gAllClients) && floorAllowed()) {
       // Work on a copy so the caller's buffer is never changed.
       uint8_t copy[kPayloadSize];
       memcpy(copy, in, sizeof(copy));
@@ -221,6 +254,62 @@ static bool imageHasUuid(mach_vm_address_t address, size_t size,
   return false;
 }
 
+static void publishActive() {
+  if (!floorAllowed())
+    publishState(
+        "off: an AMD GPU whose video clock levels were not read (Navi 21 and "
+        "Navi 23 only; vcnfloor=N applies a value of your own)");
+  else if (gAnyNavi23 && !gFloorGiven)
+    publishState(gAllClients ? "active: encode and decode (Navi 23: floor from "
+                               "its clock table, not run on one yet)"
+                             : "active: encode (Navi 23: floor from its clock "
+                               "table, not run on one yet)");
+  else
+    publishState(gAllClients ? "active: encode and decode" : "active: encode");
+}
+
+// Reads the Mac's GPUs once Lilu can list them. Either order with the library
+// load works: the state is published again if the route came first.
+static void checkGpus(void*, KernelPatcher&) {
+  auto info = DeviceInfo::create();
+  if (info == nullptr) {
+    SYSLOG("vcnfloor", "no device list, GPU check skipped");
+    return;
+  }
+  size_t navi21 = 0, navi23 = 0, other = 0;
+  uint32_t floor = 0;  // the smallest floor among the GPUs found
+  auto look = [&](IORegistryEntry* video, uint32_t vendor) {
+    uint32_t device = 0;
+    if (video == nullptr || vendor != WIOKit::VendorID::ATIAMD) return;
+    uint32_t f = 0;
+    if (WIOKit::getOSDataValue(video, "device-id", device))
+      f = chipFloor(device);
+    if (f == 0) {
+      other++;
+      return;
+    }
+    if (isNavi23(device))
+      navi23++;
+    else
+      navi21++;
+    if (floor == 0 || f < floor) floor = f;
+  };
+  for (size_t i = 0; i < info->videoExternal.size(); i++)
+    look(info->videoExternal[i].video, info->videoExternal[i].vendor);
+  DeviceInfo::deleter(info);
+  gGpus = other                ? Gpus::Other
+          : (navi21 || navi23) ? Gpus::AllKnown
+                               : Gpus::Unknown;
+  gAnyNavi23 = navi23 != 0;
+  // vcnfloor=N wins; otherwise each chip's own floor (today the same value).
+  if (!gFloorGiven && gGpus == Gpus::AllKnown) gFloor = floor;
+  SYSLOG("vcnfloor",
+         "GPUs: %zu Navi 21, %zu Navi 23, %zu other AMD; floor %u%s", navi21,
+         navi23, other, gFloor,
+         other && gFloorGiven ? " (vcnfloor= given: floor applied)" : "");
+  if (gRouted) publishActive();
+}
+
 static void onHWLibsLoad(void*, KernelPatcher& patcher, size_t index,
                          mach_vm_address_t address, size_t size) {
   size_t k = 0;
@@ -267,10 +356,11 @@ static void onHWLibsLoad(void*, KernelPatcher& patcher, size_t index,
     }
   }
   if (routed) {
+    gRouted = true;
     SYSLOG("vcnfloor", "routed %s on %s, VCN encode clock floor %u%s",
            kind.name, build->macos, gFloor,
            gAllClients ? " (all VCN clients)" : "");
-    publishState(gAllClients ? "active: encode and decode" : "active: encode");
+    publishActive();
   } else {
     SYSLOG("vcnfloor", "route failed (%d), driver left as it is",
            patcher.getError());
@@ -298,12 +388,14 @@ PluginConfiguration ADDPR(config){
     []() {
       uint32_t requested = 0;
       if (PE_parse_boot_argn("vcnfloor", &requested, sizeof(requested))) {
-        if (requested != 0)
+        if (requested != 0) {
           gFloor = requested;
-        else
+          gFloorGiven = true;
+        } else
           SYSLOG("vcnfloor", "ignoring vcnfloor=0, using %u", gFloor);
       }
       gAllClients = checkKernelArgument("-vcnfloorall");
       publishState("waiting for AMDRadeonX6000HWLibs or AMDRadeonX6800HWLibs");
+      lilu.onPatcherLoadForce(checkGpus, nullptr);
       lilu.onKextLoadForce(kHWLibs, arrsize(kHWLibs), onHWLibsLoad, nullptr);
     }};
