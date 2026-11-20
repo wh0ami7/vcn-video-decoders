@@ -67,6 +67,7 @@ plugins() {
 check "the plug-ins' VideoToolbox side, with a stand-in decoder" plugins
 
 check "only AMD's accelerator is taken" "${B}/acceltest"
+check "a decode command that never finishes times out" "${B}/waittest"
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"

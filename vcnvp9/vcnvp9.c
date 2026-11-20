@@ -51,17 +51,6 @@ typedef struct {
   uint8_t reserved[152];
 } VP9Params;
 
-typedef struct {
-  void* refcon;
-  uint32_t pollMs;
-  uint32_t wait;
-  uint32_t status, status2;
-} AVD_QueryEntry;
-typedef struct {
-  uint32_t count, pad;
-  AVD_QueryEntry* entries;
-} AVD_QueryList;
-
 struct VcnVP9 {
   AVD_Accelerator* accel;
   void* drv;
@@ -81,6 +70,8 @@ struct VcnVP9 {
   CVPixelBufferPoolRef pool;
   uint32_t poolW, poolH;
   bool poolTen;
+  bool stuck;         // a command never finished: nothing more goes out
+  unsigned fwErrors;  // decodes the firmware reported as failed
 };
 
 #define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
@@ -662,6 +653,8 @@ void vcnvp9_destroy(VcnVP9* d) {
 
 const char* vcnvp9_last_error(VcnVP9* d) { return d ? d->err : ""; }
 
+unsigned vcnvp9_firmware_errors(VcnVP9* d) { return d ? d->fwErrors : 0; }
+
 static int alloc_dpb_slot(VcnVP9* d) {
   for (int i = 0; i < NUM_DPB; i++)
     if (d->dpbRefs[i] == 0) return i;
@@ -691,13 +684,27 @@ static int submit(VcnVP9* d, VP9Params* prm) {
     snprintf(d->err, sizeof(d->err), "ScheduleAVDCommands %d", r);
     return -1;
   }
-  AVD_QueryEntry qe = {.refcon = refcons[0], .pollMs = 1, .wait = 1};
-  AVD_QueryList ql = {.count = 1, .entries = &qe};
-  r = FN(QueryAVDCommandStatus)(d->drv, &ql);
-  if (r) {
-    snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", r);
+  uint32_t fw = 0;
+  int ds = 0;
+  VcnWaitResult w =
+      vcn_wait_command(FN(QueryAVDCommandStatus), d->drv, refcons[0],
+                       VCN_COMMAND_TIMEOUT_MS, &fw, &ds);
+  if (w == VCN_WAIT_TIMEOUT) {
+    // The GPU still holds this command. Sending more work, or reading the
+    // target, could only make things worse: the session stops here.
+    d->stuck = true;
+    snprintf(d->err, sizeof(d->err),
+             "the GPU did not finish a frame in %d ms; session stopped",
+             VCN_COMMAND_TIMEOUT_MS);
     return -1;
   }
+  if (w != VCN_WAIT_DONE) {
+    snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
+    return -1;
+  }
+  // Counted, not refused: the VP9 result goes through the AV1 processor's
+  // status reader, and what it reports for VP9 has not been checked on a GPU.
+  if (fw) d->fwErrors++;
   return 0;
 }
 
@@ -813,6 +820,11 @@ int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
   d->outCtx = ctx;
   d->tag = tag;
   d->err[0] = 0;
+  if (d->stuck) {
+    snprintf(d->err, sizeof(d->err),
+             "session stopped: the GPU did not finish an earlier frame");
+    return -1;
+  }
   int r = vp9_parse_chunk(&d->parser, chunk, size, on_frame, d);
   if (r && !d->err[0])
     snprintf(d->err, sizeof(d->err), "%s",

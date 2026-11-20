@@ -33,6 +33,8 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
 // Drop all reference state (e.g. after a seek)
 void vcnav1_flush(VcnAV1* d);
 const char* vcnav1_last_error(VcnAV1* d);
+// Decodes the GPU firmware reported as failed (the picture was still output).
+unsigned vcnav1_firmware_errors(VcnAV1* d);
 // Attributes of the pixel buffers the decoder outputs (caller releases).
 CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
                                                     bool tenBit);

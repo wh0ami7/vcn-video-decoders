@@ -43,17 +43,6 @@ typedef struct {
   uint8_t reserved[160];
 } AV1Params;
 
-typedef struct {
-  void* refcon;
-  uint32_t pollMs;  // driver completion-poll interval (ms)
-  uint32_t wait;
-  uint32_t status, status2;
-} AVD_QueryEntry;
-typedef struct {
-  uint32_t count, pad;
-  AVD_QueryEntry* entries;
-} AVD_QueryList;
-
 struct VcnAV1 {
   AVD_Accelerator* accel;
   void* drv;
@@ -75,6 +64,8 @@ struct VcnAV1 {
       pool;  // decode targets; references live in the driver's internal DPB
   uint32_t poolW, poolH;
   bool poolTen;
+  bool stuck;         // a command never finished: nothing more goes out
+  unsigned fwErrors;  // decodes the firmware reported as failed
 };
 
 #define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
@@ -288,6 +279,8 @@ void vcnav1_destroy(VcnAV1* d) {
 }
 
 const char* vcnav1_last_error(VcnAV1* d) { return d ? d->err : ""; }
+
+unsigned vcnav1_firmware_errors(VcnAV1* d) { return d ? d->fwErrors : 0; }
 
 static inline void S32(uint8_t* base, int idx, int v) {
   ((int32_t*)base)[idx] = v;
@@ -521,29 +514,30 @@ static int submit(VcnAV1* d, AV1Params* prm) {
     snprintf(d->err, sizeof(d->err), "ScheduleAVDCommands %d", r);
     return -1;
   }
-  static int qmode = -1;
-  // Third field of the query entry is the driver's completion-poll interval in
-  // ms: AppleGVA's 5 adds ~5 ms of latency per frame; 1 measured 2.5 ms average
-  // wait vs 5.7 ms, bit-exact.
-  if (qmode < 0) {
-    // Env-derived poll interval: reject non-digits / out-of-range (mem:security).
-    const char* qs = getenv("VCNAV1_QMODE");
-    char* end = NULL;
-    long v = qs ? strtol(qs, &end, 10) : 1;
-    if (!qs || end == qs || *end || v < 1 || v > 100) v = 1;
-    qmode = (int)v;
-  }
-  AVD_QueryEntry qe = {
-      .refcon = refcons[0], .pollMs = (uint32_t)qmode, .wait = 1};
-  AVD_QueryList ql = {.count = 1, .entries = &qe};
-  r = FN(QueryAVDCommandStatus)(d->drv, &ql);
+  uint32_t fw = 0;
+  int ds = 0;
+  VcnWaitResult w =
+      vcn_wait_command(FN(QueryAVDCommandStatus), d->drv, refcons[0],
+                       VCN_COMMAND_TIMEOUT_MS, &fw, &ds);
   t_sched = t1 - t0;
   t_wait = tnow_ms() - t1;
-  DBG("query r=%d status=%u/%u\n", r, qe.status, qe.status2);
-  if (r) {
-    snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", r);
+  DBG("wait=%d firmware=%u driver=%d\n", (int)w, fw, ds);
+  if (w == VCN_WAIT_TIMEOUT) {
+    // The GPU still holds this command. Sending more work, or reading the
+    // target, could only make things worse: the session stops here.
+    d->stuck = true;
+    snprintf(d->err, sizeof(d->err),
+             "the GPU did not finish a frame in %d ms; session stopped",
+             VCN_COMMAND_TIMEOUT_MS);
     return -1;
   }
+  if (w != VCN_WAIT_DONE) {
+    snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
+    return -1;
+  }
+  // Counted, not refused: what each firmware result means for the picture
+  // has not been checked on a GPU yet.
+  if (fw) d->fwErrors++;
   return 0;
 }
 
@@ -708,6 +702,11 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
   d->outCtx = ctx;
   d->tag = userTag;
   d->err[0] = 0;
+  if (d->stuck) {
+    snprintf(d->err, sizeof(d->err),
+             "session stopped: the GPU did not finish an earlier frame");
+    return -1;
+  }
   int r = av1_parse_temporal_unit(&d->parser, tu, size, on_frame, d);
   if (r && !d->err[0])
     snprintf(d->err, sizeof(d->err), "bitstream parse error");

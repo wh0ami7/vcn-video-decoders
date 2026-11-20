@@ -26,4 +26,6 @@ for c in av1 vp9; do
 done
 xcrun clang "${TFLAGS[@]}" -I../vcncommon acceltest.c ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework IOKit -o "${B}/acceltest"
+xcrun clang "${TFLAGS[@]}" -I../vcncommon waittest.c ../vcncommon/vcndriver.c \
+  -framework CoreFoundation -framework IOKit -o "${B}/waittest"
 echo "built the tests in tests/${B}"

@@ -288,10 +288,11 @@ static void stats_add(Storage* s, double queued, double decode) {
     os_log(logger(),
            "stats %dx%d: %d frames in %.0f ms, decode avg %.2f max %.2f ms, "
            "queue avg %.2f max %.2f ms, "
-           "over 16.7 ms %d, max depth %d",
+           "over 16.7 ms %d, max depth %d, firmware errors %u",
            s->width, s->height, s->st_n, now_ms() - s->st_t0,
            s->st_dec_sum / s->st_n, s->st_dec_max, s->st_q_sum / s->st_n,
-           s->st_q_max, s->st_over, s->st_depth_max);
+           s->st_q_max, s->st_over, s->st_depth_max,
+           vcnvp9_firmware_errors(s->vcn));
     s->st_n = s->st_over = s->st_depth_max = 0;
     s->st_dec_sum = s->st_dec_max = s->st_q_sum = s->st_q_max = 0;
   }

@@ -123,6 +123,10 @@ const char* vcnav1_last_error(VcnAV1* d) {
   (void)d;
   return "stand-in";
 }
+unsigned vcnav1_firmware_errors(VcnAV1* d) {
+  (void)d;
+  return 0;
+}
 CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
                                                     bool t) {
   (void)w, (void)h, (void)t;
@@ -144,6 +148,10 @@ void vcnvp9_destroy(VcnVP9* d) { fake_destroy(d); }
 const char* vcnvp9_last_error(VcnVP9* d) {
   (void)d;
   return "stand-in";
+}
+unsigned vcnvp9_firmware_errors(VcnVP9* d) {
+  (void)d;
+  return 0;
 }
 CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
                                                     bool t) {

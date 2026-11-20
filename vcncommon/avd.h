@@ -145,7 +145,25 @@ typedef int (*AVD_AllocateBitstreamBufferPool_fn)(void* driver,
 typedef int (*AVD_FreeBitstreamBufferPool_fn)(void* driver, uint32_t type);
 typedef int (*AVD_ScheduleAVDCommands_fn)(void* driver, AVD_CmdList* cmds,
                                           AVD_RefConList* refcons);
-typedef int (*AVD_QueryAVDCommandStatus_fn)(void* driver, void* query);
+// One entry of QueryAVDCommandStatus. Read in the 25G342 driver (IDA,
+// AvdVAContext::QueryAVDCommandStatus): besides the refcon, +12 `wait` is the
+// only input; +8 is never read. With wait = 0 the call returns at once: status
+// 1 = done, 2 = still running, status2 = 0. With wait != 0 it blocks in the
+// kernel (no timeout in user space) until the command is done, then status = 1
+// and status2 = the firmware's decode result (0 = no error).
+typedef struct {
+  void* refcon;
+  uint32_t
+      unused8;  // once taken for a poll interval; the driver never reads it
+  uint32_t wait;
+  uint32_t status, status2;
+} AVD_QueryEntry;
+typedef struct {
+  uint32_t count, pad;
+  AVD_QueryEntry* entries;
+} AVD_QueryList;
+
+typedef int (*AVD_QueryAVDCommandStatus_fn)(void* driver, AVD_QueryList* query);
 typedef int (*AVD_DeleteDriver_fn)(void* driver);
 
 #endif  // VCNCOMMON_AVD_H_

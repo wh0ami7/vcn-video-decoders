@@ -32,5 +32,7 @@ void vcnvp9_destroy(VcnVP9* d);
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
                   VcnVP9OutputFn fn, void* ctx);
 const char* vcnvp9_last_error(VcnVP9* d);
+// Decodes the GPU firmware reported as failed (the picture was still output).
+unsigned vcnvp9_firmware_errors(VcnVP9* d);
 
 #endif  // VCNVP9_VCNVP9_H_

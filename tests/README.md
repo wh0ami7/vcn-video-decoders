@@ -18,3 +18,4 @@ programs are built with the address and undefined-behaviour sanitizers.
 | `av1state` | A refused AV1 sample or frame header leaves the parser as it was: no frame from a half-written header, reference state restored, tile groups in order |
 | `vp9state` | A refused VP9 frame header restores the parser state it changed (colour config, loop filter deltas, segmentation); a frame with no tile data is refused |
 | `plugintest-av1`, `plugintest-vp9` | Each plug-in's VideoToolbox side, with the decoder session replaced by a stand-in: factory and session start, codec check, shown and dropped frames, calls made from inside the output callback, invalidate |
+| `waittest` | The wait for one decode command (`vcn_wait_command`) against a made-up driver: done, firmware error, driver error, and a command that never finishes, which must time out |
