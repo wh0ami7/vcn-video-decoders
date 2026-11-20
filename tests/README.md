@@ -1,0 +1,16 @@
+# Tests that need no GPU
+
+```bash
+./tests/run.sh           # builds and runs all of them
+./tests/run.sh --quick   # fewer damaged copies per stream
+```
+
+`tests/fetch_media.sh` (run by `run.sh`) downloads the public test streams into
+`tests/media/` and checks each one against `tests/media-sha256.txt`: AV1 vectors
+from the AOM test data, VP9 vectors from libvpx, and libvpx's damaged VP9
+streams. Nothing here opens the GPU, loads a kext or installs anything. The
+programs are built with the address and undefined-behaviour sanitizers.
+
+| Program | What it checks |
+|---|---|
+| `parsedigest` | The AV1 and VP9 header parsers read every stream exactly as recorded in `expected-digests.txt`, survive libvpx's invalid streams, and survive thousands of copies damaged at random (`--mutate`) |

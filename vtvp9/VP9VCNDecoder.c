@@ -264,6 +264,10 @@ static void stats_add(Storage* s, double queued, double decode) {
   }
 }
 
+// A sample larger than one bitstream buffer of the driver pool (BS_SIZE in
+// the session code) cannot be decoded: refuse it before copying anything.
+enum { kMaxSampleBytes = 0x1800000 };
+
 // Decode one chunk and hand its shown frame to VideoToolbox. A chunk with only
 // hidden frames is valid and has nothing to show.
 static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
@@ -274,12 +278,10 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
   OSStatus status = noErr;
   uint8_t* copy = NULL;
   char* ptr = NULL;
-  if (!len)
+  if (!len || len > kMaxSampleBytes)
     status = kVTVideoDecoderBadDataErr;
   else if (CMBlockBufferIsRangeContiguous(bb, 0, len) &&
            !CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &ptr) && ptr) {
-  } else if (len > 0x1800000u) {
-    status = kVTVideoDecoderBadDataErr;
   } else {
     copy = malloc(len);
     if (!copy || CMBlockBufferCopyDataBytes(bb, 0, len, copy))
