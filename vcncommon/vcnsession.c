@@ -81,18 +81,26 @@ bool vcn_session_open(VcnDriverSession* s, const VcnDriverLib* lib,
                    "accelerator open",
                    lib->uuid);
   }
-  uint32_t services[8] = {svc};
+  // One service, and the mask says so. The driver opens services[index] and
+  // reads no other entry (avd.h, AVD_AcceleratorCreate).
+  uint32_t services[1] = {svc};
   AVD_AcceleratorCreate ac = {
-      .index = 0, .services = services, .validMask = 0xffffffff};
+      .index = 0, .services = services, .validMask = 1u << 0};
   uint8_t info[256] = {0};
   int r = lib->create(&s->accel, &ac, info);
   if (r || !s->accel) {
-    s->accel = NULL;  // nothing to destroy: the driver frees it on failure
+    // Nothing to destroy: on every failure the driver frees the accelerator
+    // itself and leaves the result NULL (read in IDA, see avd.h). A result
+    // set anyway is not one this call made.
+    s->accel = NULL;
     FAIL("CreateAVDAccelerator %d", r);
   }
   AVD_DriverCreate dc = {.initFlags = 0, .accel = s->accel};
   r = FN(CreateDriver)(&s->drv, &dc);
   if (r || !s->drv) {
+    // Nothing to delete: a failed CreateDriver returns no handle, and what it
+    // made stays inside the driver (read in IDA, see avd.h). The accelerator
+    // is still destroyed by the close below.
     s->drv = NULL;
     FAIL("CreateDriver %d", r);
   }

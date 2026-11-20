@@ -20,14 +20,22 @@
 //      kVTAllocationFailedErr;
 //  10. after a start that fails, no format is accepted;
 //  11. canAcceptFormatDescription does not wait for a decode in progress;
-//  12. a start that invalidate overtakes closes its new session again.
+//  12. a start that invalidate overtakes closes its new session again;
+//  13. an invalidate on another thread while a decode waits for a queue slot
+//      returns only after that decode has left the plug-in, and the frame is
+//      refused.
 //
 // usage: plugintest   (exit status 0 = pass)
 #include <dispatch/dispatch.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
 
+// The plug-in's semaphore waits go through test_semaphore_wait, so that test
+// 13 can hold a decode between taking a queue slot and queuing its frame.
+static long test_semaphore_wait(dispatch_semaphore_t sem, dispatch_time_t t);
+#define dispatch_semaphore_wait test_semaphore_wait
 #if defined(TEST_AV1)
 #include "../vtav1/AV1VCNDecoder.c"
 #define CODEC kCMVideoCodecType_AV1
@@ -43,6 +51,18 @@ typedef VcnVP9OutputFn OutputFn;
 #else
 #error "build with -DTEST_AV1 or -DTEST_VP9"
 #endif
+#undef dispatch_semaphore_wait
+
+// Run once, by the next plug-in wait that returns, before the plug-in goes on.
+static void (*afterWait)(void);
+static int waitsStarted;
+static long test_semaphore_wait(dispatch_semaphore_t sem, dispatch_time_t t) {
+  __atomic_add_fetch(&waitsStarted, 1, __ATOMIC_SEQ_CST);
+  long r = dispatch_semaphore_wait(sem, t);
+  void (*hook)(void) = __atomic_exchange_n(&afterWait, NULL, __ATOMIC_SEQ_CST);
+  if (hook) hook();
+  return r;
+}
 
 static int failures;
 static void expect(const char* what, bool ok) {
@@ -273,6 +293,33 @@ static void reenter(void) {
   reentered = 1;
 }
 
+// Test 13: a decode on its own thread that waits for a queue slot, and an
+// invalidate on another. Each says, through `order`, when it left the plug-in.
+static dispatch_semaphore_t slotTaken, slotHold, invalidateDone;
+static int order, decodeLeft, invalidateLeft;
+static OSStatus waitingResult;
+static CMSampleBufferRef waitingSample;
+static void hold_after_slot(void) {
+  dispatch_semaphore_signal(slotTaken);
+  dispatch_semaphore_wait(slotHold,
+                          dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+}
+static void* waiting_decode(void* arg) {
+  (void)arg;
+  waitingResult =
+      dec_decode_frame(dec, NULL, waitingSample,
+                       kVTDecodeFrame_EnableAsynchronousDecompression, NULL);
+  decodeLeft = __atomic_add_fetch(&order, 1, __ATOMIC_SEQ_CST);
+  return NULL;
+}
+static void* invalidating(void* arg) {
+  (void)arg;
+  base_invalidate((CMBaseObjectRef)dec);
+  invalidateLeft = __atomic_add_fetch(&order, 1, __ATOMIC_SEQ_CST);
+  dispatch_semaphore_signal(invalidateDone);
+  return NULL;
+}
+
 static void hung(int sig) {
   (void)sig;
   static const char msg[] = "FAIL a call from inside the callback hung\n";
@@ -417,6 +464,64 @@ int main(void) {
              destroys == d0 + 1 && !dec_can_accept_format(dec, fmt));
   base_finalize((CMBaseObjectRef)dec);
   free(dec);
+
+  // 13. The queue is full of slow frames, a decode waits for a slot, and
+  // another thread invalidates. The decode is held after it gets its slot:
+  // invalidate must not return (and the host must not be able to free the
+  // decoder) while that decode is still inside the plug-in.
+  expect("a decoder for the invalidate during a decode test",
+         !CREATE(CODEC, NULL, &dec) && dec);
+  expect("its session starts too", !dec_start_session(dec, NULL, fmt));
+  slowEntered = dispatch_semaphore_create(0);
+  slowRelease = dispatch_semaphore_create(0);
+  slowTimedOut = false;
+  slotTaken = dispatch_semaphore_create(0);
+  slotHold = dispatch_semaphore_create(0);
+  invalidateDone = dispatch_semaphore_create(0);
+  CMSampleBufferRef slow13 = sample(5);
+  waitingSample = shown;
+  e = emits;
+  for (int i = 0; i < MAX_QUEUED; i++)
+    dec_decode_frame(dec, NULL, slow13,
+                     kVTDecodeFrame_EnableAsynchronousDecompression, NULL);
+  bool decoding = !dispatch_semaphore_wait(
+      slowEntered, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  int w0 = __atomic_load_n(&waitsStarted, __ATOMIC_SEQ_CST);
+  afterWait = hold_after_slot;
+  pthread_t ta, tb;
+  pthread_create(&ta, NULL, waiting_decode, NULL);
+  // Until the decode is in its wait for a slot (at most 2 s).
+  for (int i = 0;
+       i < 2000 && __atomic_load_n(&waitsStarted, __ATOMIC_SEQ_CST) == w0; i++)
+    usleep(1000);
+  bool waiting = __atomic_load_n(&waitsStarted, __ATOMIC_SEQ_CST) > w0 &&
+                 !__atomic_load_n(&decodeLeft, __ATOMIC_SEQ_CST);
+  pthread_create(&tb, NULL, invalidating, NULL);
+  // Until invalidate has begun (at most 300 ms): the format is not accepted
+  // from then on.
+  for (int i = 0; i < 300 && dec_can_accept_format(dec, fmt); i++) usleep(1000);
+  for (int i = 0; i < MAX_QUEUED; i++) dispatch_semaphore_signal(slowRelease);
+  bool tookSlot = !dispatch_semaphore_wait(
+      slotTaken, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  // The decode is held now. An invalidate that does not wait for it is done
+  // within this second.
+  bool invalidateFirst = !dispatch_semaphore_wait(
+      invalidateDone, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
+  dispatch_semaphore_signal(slotHold);
+  pthread_join(ta, NULL);
+  pthread_join(tb, NULL);
+  expect("test 13 set-up: the queue is full and a decode waits for a slot",
+         decoding && waiting && tookSlot && !slowTimedOut);
+  expect("invalidate waits for a decode still on its way into the queue",
+         !invalidateFirst && decodeLeft && invalidateLeft &&
+             decodeLeft < invalidateLeft);
+  expect(
+      "that decode is refused, and only the frames queued before are "
+      "emitted",
+      waitingResult == kVTInvalidSessionErr && emits == e + MAX_QUEUED);
+  base_finalize((CMBaseObjectRef)dec);
+  free(dec);
+  CFRelease(slow13);
 
 #if defined(TEST_AV1)
   // av1C: marker/version, profile 0 level 0, 8-bit 4:2:0, then one config byte.

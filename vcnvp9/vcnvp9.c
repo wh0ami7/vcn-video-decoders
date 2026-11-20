@@ -603,7 +603,11 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   // may read it at any time once it is published, so it never changes again.
   static void* factoryVt[FACTORY_SLOTS + 2];
   static void** factoryOrigVt;
+  // driver+8 is the VAContext, VAContext+75072 its VAFactory (avd.h,
+  // AVD_CreateDriver_fn). Each is checked before it is read through: a NULL
+  // fails the start like any other step instead of a read at a small address.
   uint8_t* va = PTR(d->s.drv, 8);
+  if (!va) FAIL("no VAContext");
   void*** factory = (void***)PTR(va, 75072);
   if (!factory || !*factory) FAIL("no factory");
   vcnvp9_dryrun_checkpoint(1);

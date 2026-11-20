@@ -100,6 +100,13 @@ typedef struct {
   pthread_mutex_t meta;
   CMVideoFormatDescriptionRef format;  // of the running session; NULL: none
   bool broken;  // the session failed as a device: it decodes nothing more
+  // Also under meta. closing: invalidate or finalize has begun, frames are
+  // refused. callers: decodeFrame calls from outside the decode queue that
+  // are still in the plug-in (waiting for a slot, queuing, or decoding at
+  // once); idle is signalled when the count drops to 0.
+  bool closing;
+  int callers;
+  pthread_cond_t idle;
   dispatch_queue_t
       queue;  // serial: frames are decoded (and emitted) in submission order
   dispatch_semaphore_t slots;  // bounds frames queued but not yet decoded
@@ -177,6 +184,41 @@ static void drain(Storage* s) {
   while (__atomic_load_n(&s->depth, __ATOMIC_RELAXED) > 0);
 }
 
+// A decodeFrame call from outside the decode queue counts itself in callers
+// for as long as it runs. Returns false, counting nothing, once invalidate or
+// finalize has begun.
+static bool enter_call(Storage* s, bool counted) {
+  pthread_mutex_lock(&s->meta);
+  bool open = !s->closing;
+  if (open && counted) s->callers++;
+  pthread_mutex_unlock(&s->meta);
+  return open;
+}
+static void leave_call(Storage* s) {
+  pthread_mutex_lock(&s->meta);
+  if (--s->callers == 0) pthread_cond_broadcast(&s->idle);
+  pthread_mutex_unlock(&s->meta);
+}
+static bool is_closing(Storage* s) {
+  pthread_mutex_lock(&s->meta);
+  bool closing = s->closing;
+  pthread_mutex_unlock(&s->meta);
+  return closing;
+}
+// Refuses frames from now on and waits for the decodeFrame calls still on
+// their way in: drain() only sees frames already queued, and a call that
+// waits for a slot has not queued its frame yet. From the decode queue (the
+// output callback) nothing is waited for: a call waiting for a slot may be
+// waiting for the frame whose callback this is. Such a call refuses its frame
+// once it gets the slot, and finalize, which runs off the queue, waits for it.
+static void close_calls(Storage* s) {
+  pthread_mutex_lock(&s->meta);
+  s->closing = true;
+  if (!on_queue(s))
+    while (s->callers > 0) pthread_cond_wait(&s->idle, &s->meta);
+  pthread_mutex_unlock(&s->meta);
+}
+
 static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
   CFDictionaryRef atoms = CMFormatDescriptionGetExtension(
       fmt, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
@@ -195,9 +237,12 @@ static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
 // ---------------------------------------------------------------------------
 static OSStatus base_invalidate(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
+  // Frames handed in from now on are refused; the ones already queued are
+  // still emitted.
+  close_calls(s);
   drain(s);
   pthread_mutex_lock(&s->lock);
-  // Frames handed in from now on are refused, and none is emitted any more.
+  // None is emitted any more.
   __atomic_store_n(&s->invalidated, true, __ATOMIC_RELAXED);
   end_session(s, "invalidated");
   pthread_mutex_unlock(&s->lock);
@@ -206,12 +251,14 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
 
 static void base_finalize(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
+  close_calls(s);  // nothing below may go while a decodeFrame still uses it
   drain(s);
   end_session(s, "finalized");  // releases the format too
   if (s->queue) dispatch_release(s->queue);
   if (s->slots) dispatch_release(s->slots);
   pthread_mutex_destroy(&s->lock);
   pthread_mutex_destroy(&s->meta);
+  pthread_cond_destroy(&s->idle);
 }
 
 static CFStringRef base_copy_debug_description(CMBaseObjectRef obj) {
@@ -456,23 +503,32 @@ static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
   Storage* s = storage_of(dec);
   if (infoOut) *infoOut = 0;
   if (!sbuf) return kVTParameterErr;
-  if (__atomic_load_n(&s->invalidated, __ATOMIC_RELAXED))
-    return kVTInvalidSessionErr;
+  // From inside the output callback the queue is already running this code,
+  // and invalidate run from there waits for no call (see close_calls).
+  bool counted = !on_queue(s);
+  if (!enter_call(s, counted)) return kVTInvalidSessionErr;
   if (!(flags & kVTDecodeFrame_EnableAsynchronousDecompression)) {
     double t = now_ms();
-    // From inside the output callback the queue is already running this code.
-    if (on_queue(s))
+    if (!counted)
       decode_and_emit(s, frame, sbuf, t);
     else
       dispatch_sync(s->queue, ^{
         decode_and_emit(s, frame, sbuf, t);
       });  // keeps order with queued work
+    if (counted) leave_call(s);
     return noErr;
   }
   // From inside the output callback the running frame still holds its slot,
   // so waiting for one could wait for ever: queue the frame without one.
-  bool counted = !on_queue(s);
-  if (counted) dispatch_semaphore_wait(s->slots, DISPATCH_TIME_FOREVER);
+  if (counted) {
+    dispatch_semaphore_wait(s->slots, DISPATCH_TIME_FOREVER);
+    // An invalidate that began during the wait refuses the frame.
+    if (is_closing(s)) {
+      dispatch_semaphore_signal(s->slots);
+      leave_call(s);
+      return kVTInvalidSessionErr;
+    }
+  }
   CFRetain(sbuf);
   double t = now_ms();
   __atomic_add_fetch(&s->depth, 1, __ATOMIC_RELAXED);
@@ -483,6 +539,8 @@ static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
     if (counted) dispatch_semaphore_signal(s->slots);
   });
   if (infoOut) *infoOut = kVTDecodeInfo_Asynchronous;
+  // Queued and counted in depth: from here on drain() waits for the frame.
+  if (counted) leave_call(s);
   return noErr;
 }
 
@@ -510,15 +568,12 @@ static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
                                      CMFormatDescriptionRef fmt) {
   Storage* s = storage_of(dec);
   if (!fmt) return false;
-  // A decoder whose start failed, whose session broke or that was invalidated
-  // takes no format: VideoToolbox must make a new one. Read under meta, not
-  // lock: a decode holds lock while the GPU works on its frame.
+  // A decoder whose start failed, whose session broke or whose invalidate has
+  // begun takes no format: VideoToolbox must make a new one. Read under meta,
+  // not lock: a decode holds lock while the GPU works on its frame.
   pthread_mutex_lock(&s->meta);
   CMFormatDescriptionRef cur =
-      s->format && !s->broken &&
-              !__atomic_load_n(&s->invalidated, __ATOMIC_RELAXED)
-          ? CFRetain(s->format)
-          : NULL;
+      s->format && !s->broken && !s->closing ? CFRetain(s->format) : NULL;
   pthread_mutex_unlock(&s->meta);
   if (!cur) return false;
   Boolean same = false;
@@ -576,6 +631,7 @@ __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
   memset(s, 0, sizeof(*s));
   pthread_mutex_init(&s->lock, NULL);
   pthread_mutex_init(&s->meta, NULL);
+  pthread_cond_init(&s->idle, NULL);
   s->queue = dispatch_queue_create(
       "com.droga.vtav1vcn.decode",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,

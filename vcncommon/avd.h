@@ -18,14 +18,25 @@
 #define AVD_FUNC_HEVC 0x800ull
 #define AVD_FUNC_AV1 0x1000000ull
 
-// Argument of AVD_CreateAVDAccelerator.
+// Argument of AVD_CreateAVDAccelerator. Read in the 25G342 driver (IDA,
+// AVD_CreateAVDAccelerator at 0x7FFB10B009E0, export offset 0x9E0): it keeps
+// validMask at inner+0, the number of the highest bit set plus one at inner+4
+// and the services pointer at inner+8 (0x...A69-AA0). It goes on only if bit
+// `index` of validMask is set, index is below that count and services[index]
+// is not 0; otherwise it returns 5 (0x...AA2-ACC). services[index] is then
+// the only entry it reads: the service it hands to IOAccelDeviceCreate
+// (0x...AC7, call at 0x...AD1). Nothing reads inner+0/+4/+8 again:
+// CreateDriver takes inner+24/+32/+40/+52/+64/+72/+88/+96 and
+// AVD_DestroyAVDAccelerator releases +32..+96. So one service in services[0],
+// index 0 and validMask 1 is all it needs. AppleGVA passes index 0 and
+// validMask 0xffffffff (sub_7FFA0C59F7A6), which passes the same check.
 typedef struct {
-  uint32_t index;  // which entry of services[] to use
+  uint32_t index;  // the entry of services[] the driver opens
   uint32_t pad0;
-  uint32_t* services;  // io_service_t array (accelerator service ports)
+  uint32_t* services;  // io_service_t array; the driver keeps the pointer only
   uint32_t validMask;  // bit i set => services[i] valid
   uint32_t pad1;
-  uint8_t reserved[0x30];
+  uint8_t reserved[0x30];  // +0x18..+0x27 copied to inner+16 (AppleGVA: 0)
 } AVD_AcceleratorCreate;
 
 typedef struct {
@@ -133,6 +144,20 @@ typedef struct {
   void** refcons;  // out
 } AVD_RefConList;
 
+// Read in the 25G342 driver (IDA, 0x7FFB10B009E0): *out = NULL first
+// (0x...9EE), set only on success (0x...D70). Returns 5 for a NULL `in` or
+// info, for a service the check above refuses, and for a device it does not
+// drive (identify() 11 or 12); 1 when IOAccelDeviceCreate,
+// IOAccelDeviceGetConfig, IOAccelSharedCreate, IOAccelVideoContextCreate or
+// AvdCapability::initDriverCapability fails. On every failure it frees the
+// accelerator and its inner object itself (operator delete, 0x...B1E-B38):
+// there is nothing for the caller to destroy, and the caller must not.
+// Whatever it opened is released before that (0x...B09, 0x...BA6-BBE,
+// 0x...BE1), except after a failed initDriverCapability (0x...C7B): then only
+// the VAIOConnect and the AvdCapability are deleted, and the IOAccelDevice,
+// IOAccelShared and IOAccelVideoContext stay open inside the driver with no
+// handle left to the caller. That leak is the driver's; the caller cannot undo
+// it.
 typedef int (*AVD_CreateAVDAccelerator_fn)(AVD_Accelerator** out,
                                            AVD_AcceleratorCreate* in,
                                            void* info96);
@@ -141,10 +166,26 @@ typedef int (*AVD_CreateAVDAccelerator_fn)(AVD_Accelerator** out,
 // VAIOConnect and the AvdCapability) and frees the accelerator itself. Returns
 // 0. DeleteDriver releases none of it.
 typedef int (*AVD_DestroyAVDAccelerator_fn)(AVD_Accelerator* accel);
+// Read in the 25G342 driver (IDA, AvdVAInterface::CreateDriver at
+// 0x7FFB10B01EF6): returns 5 for NULL arguments or a failed VAContext::Init,
+// and writes *driver only on success. After a failed Init the AvdVAContext
+// (856 bytes) and the VAContext (75096 bytes) it made stay allocated in the
+// driver, with no handle to the caller; Init's own failure paths free only
+// its address library (whether the VAContext constructor opens anything was
+// not read). There is nothing to delete: DeleteDriver needs the handle that
+// was never returned. On success driver+8 is the VAContext, and
+// VAContext+75072 its VAFactory, the last thing Init sets; vcnvp9.c reads
+// both.
 typedef int (*AVD_CreateDriver_fn)(void** driver, AVD_DriverCreate* dc);
 typedef int (*AVD_CreateContexts_fn)(void* driver, AVD_DriverContextInit* init);
 typedef int (*AVD_DeleteContexts_fn)(void* driver,
                                      AVD_DriverContextDelete* del);
+// Read in the 25G342 driver (IDA, AvdVAContext::AllocateBitStreamBufferPool
+// at 0x7FFB10B5E0C6): when a buffer cannot be made after others were, it
+// runs its own FreeBitStreamBufferPool (0x7FFB10B5E20E) before it returns 7,
+// and the pool is not marked allocated. A second free from the caller would
+// walk the same entries, now NULL, into VAVendorTexture::DeleteTexture(NULL).
+// So a pool whose Allocate did not return 0 is never freed by the caller.
 typedef int (*AVD_AllocateBitstreamBufferPool_fn)(void* driver,
                                                   AVD_BitstreamPool* pool);
 typedef int (*AVD_FreeBitstreamBufferPool_fn)(void* driver, uint32_t type);

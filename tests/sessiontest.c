@@ -21,7 +21,12 @@
 //   6. a ScheduleAVDCommands failure is a device failure; a firmware result
 //      is counted, the frame is not refused;
 //   7. a pool with a missing buffer fails the create and is freed; a failed
-//      CreateAVDAccelerator that leaves its result set destroys nothing.
+//      CreateAVDAccelerator that leaves its result set destroys nothing;
+//   8. the accelerator is asked for one service, as the 25G342 driver checks
+//      it (common/avd.h), and every create that fails part way releases what
+//      it made in the same order as a full close;
+//   9. (VP9) a driver handle whose VAContext is NULL fails the create and is
+//      released, without a read through it.
 //
 // usage: sessiontest <first frames of a small IVF clip of the codec>
 // Exit status 0 = pass.
@@ -83,6 +88,7 @@ static struct {
   int creates, destroys, createDrivers, deleteDrivers, allocs, frees, createCtx,
       deleteCtx, schedules, queries;
   int seq, seqDeleteCtx, seqFree, seqDeleteDriver, seqDestroy;
+  uint32_t mask, index, service;  // what CreateAVDAccelerator was asked for
   int liveAccels, liveDrivers;
   bool freeWithoutPool;  // FreeBitstreamBufferPool on a pool never allocated
   bool useAfterDestroy;  // a driver call after the accelerator was destroyed
@@ -95,6 +101,7 @@ static struct {
   int queryFail;      // QueryAVDCommandStatus returns this
   bool leaveOut;      // a failed CreateAVDAccelerator leaves *out set
   bool nullBuf;       // the pool comes back without its second buffer
+  bool noVA;          // the driver handle's +8 (the VAContext) is NULL
   bool hang;          // commands never finish
   unsigned firmware;  // result of every finished command
   bool noDestroy;     // the build has no AVD_DestroyAVDAccelerator
@@ -126,7 +133,7 @@ static int f_create_driver(void** out, AVD_DriverCreate* dc) {
   *(void**)((uint8_t*)d->va + 75072) = d->factory;
   // the layout vcnvp9.c reads: drv+8 -> VAContext
   void** raw = calloc(2, sizeof(void*));
-  raw[1] = d->va;
+  raw[1] = fault.noVA ? NULL : d->va;
   // keep FakeDrv reachable from the handle: raw[0]
   raw[0] = d;
   st.liveDrivers++;
@@ -216,11 +223,24 @@ static int f_query(void* h, AVD_QueryList* q) {
 
 static int f_create_accel(AVD_Accelerator** out, AVD_AcceleratorCreate* in,
                           void* info) {
-  (void)in, (void)info;
+  (void)info;
   st.creates++;
   *out = NULL;
+  // The 25G342 driver's check (common/avd.h): bit `index` of the mask set,
+  // index below the highest bit set plus one, services[index] not 0.
+  st.mask = in->validMask;
+  st.index = in->index;
+  uint32_t count = 0;
+  for (uint32_t i = 0; i < 32; i++)
+    if (in->validMask >> i & 1) count = i + 1;
+  if (in->index >= 32 || !(in->validMask >> in->index & 1) ||
+      in->index >= count || !in->services[in->index])
+    return 5;
+  st.service = in->services[in->index];
   if (fault.create) {
-    // Never made: a destroy or a driver call through it is seen.
+    // Never made: a destroy or a driver call through it is seen. The real
+    // driver never leaves *out set on a failure (common/avd.h); leaveOut is a
+    // driver that would, which must not be destroyed either.
     static FakeAccel stray;
     if (fault.leaveOut) *out = &stray.a;
     return fault.create;
@@ -293,6 +313,17 @@ static void reset(void) {
   memset(&st, 0, sizeof(st));
   memset(&fault, 0, sizeof(fault));
 }
+// The calls a close made come in Apple's order, whichever of them ran.
+static bool released_in_order(void) {
+  int seq[] = {st.seqDeleteCtx, st.seqFree, st.seqDeleteDriver, st.seqDestroy};
+  int last = 0;
+  for (int i = 0; i < 4; i++) {
+    if (!seq[i]) continue;
+    if (seq[i] < last) return false;
+    last = seq[i];
+  }
+  return true;
+}
 static bool all_released(void) {
   return st.liveAccels == 0 && st.liveDrivers == 0 && !st.useAfterDestroy &&
          !st.freeWithoutPool;
@@ -345,6 +376,8 @@ int main(int argc, char** argv) {
          st.seqDeleteCtx && st.seqDeleteCtx < st.seqFree &&
              st.seqFree < st.seqDeleteDriver &&
              st.seqDeleteDriver < st.seqDestroy);
+  expect("the accelerator is asked for services[0] only, as one valid entry",
+         st.index == 0 && st.mask == 1 && st.service != 0);
 
   reset();
   fault.create = 1;
@@ -362,25 +395,36 @@ int main(int argc, char** argv) {
   fault.createDriver = 5;
   expect("a failed CreateDriver still destroys the accelerator, once",
          !make() && st.destroys == 1 && st.frees == 0 &&
-             st.deleteDrivers == 0 && all_released());
+             st.deleteDrivers == 0 && all_released() && st.seqDestroy);
 
   reset();
   fault.alloc = 7;
   expect("a failed pool allocation: the pool is not freed, the rest is",
          !make() && st.frees == 0 && st.deleteDrivers == 1 &&
              st.destroys == 1 && all_released());
+  expect("in order: driver, accelerator", released_in_order());
 
   reset();
   fault.nullBuf = true;
   expect("a pool with a missing buffer fails the create and is freed",
          !make() && st.createCtx == 0 && st.frees == 1 &&
              st.deleteDrivers == 1 && st.destroys == 1 && all_released());
+  expect("in order: pool, driver, accelerator", released_in_order());
 
   reset();
   fault.createCtx = 10;
   expect("a failed CreateContexts: no context deleted, the rest released",
          !make() && st.deleteCtx == 0 && st.frees == 1 &&
              st.deleteDrivers == 1 && st.destroys == 1 && all_released());
+  expect("in order: pool, driver, accelerator", released_in_order());
+
+#if defined(TEST_VP9)
+  reset();
+  fault.noVA = true;
+  expect("a driver handle with no VAContext fails the create, all released",
+         !make() && st.createCtx == 0 && st.deleteDrivers == 1 &&
+             st.destroys == 1 && all_released() && released_in_order());
+#endif
 
   reset();
   fault.noDestroy = true;
@@ -439,10 +483,13 @@ int main(int argc, char** argv) {
   int rs = d ? DECODE(d, frame0, frame0Size, 0, on_out, NULL) : 0;
   int ks = d ? FAILURE(d) : -1;
   fault.schedule = 0;
+  int schedulesBefore = st.schedules;
   int rs2 = d ? DECODE(d, frame0, frame0Size, 1, on_out, NULL) : 0;
   int ks2 = d ? FAILURE(d) : -1;
   expect("a ScheduleAVDCommands failure is a device failure, and sticks",
          rs != 0 && ks == FAIL_DEVICE && rs2 != 0 && ks2 == FAIL_DEVICE);
+  expect("and the frames after it send nothing",
+         schedulesBefore == 1 && st.schedules == schedulesBefore);
   if (d) DESTROY(d);
   expect("and that session closes fully", all_released());
 
