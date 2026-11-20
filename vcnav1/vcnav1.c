@@ -3,8 +3,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreVideo/CoreVideo.h>
 #include <IOKit/IOKitLib.h>
-#include <dlfcn.h>
 #include <mach/mach_time.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,8 +23,8 @@ int vcnav1_gpu_armed = 0;
 
 #define VCN_MODE_VCN0 4
 #define NUM_DPB 9
-#define NUM_BS 4
-#define BS_SIZE 0x1800000u
+#define NUM_BS VCN_NUM_BS
+#define BS_SIZE VCN_BS_SIZE
 #define SEQ_BYTES 2048
 #define FRAME_BYTES 4096
 #define BSINFO_BYTES (20 + 64 * 512 + 64)
@@ -44,13 +44,9 @@ typedef struct {
 } AV1Params;
 
 struct VcnAV1 {
-  AVD_Accelerator* accel;
-  void* drv;
-  void* ctx;
-  void* bsAddr[NUM_BS];
+  VcnDriverSession s;  // accelerator, driver, context and bitstream pool
   int bsNext;
   uint32_t maxW, maxH;
-  io_service_t svc;  // the accelerator handed to the driver; ours to release
   AV1Parser parser;
   CVPixelBufferRef dpb[NUM_DPB];  // last picture decoded into each DPB slot
                                   // (kept for show_existing_frame)
@@ -64,11 +60,23 @@ struct VcnAV1 {
       pool;  // decode targets; references live in the driver's internal DPB
   uint32_t poolW, poolH;
   bool poolTen;
-  bool stuck;         // a command never finished: nothing more goes out
+  bool stuck;         // a command never finished: the GPU may still hold it
+  bool broken;        // stuck, or a driver call failed: nothing more goes out
+  int failure;        // VCNAV1_FAIL_* of the last error
   unsigned fwErrors;  // decodes the firmware reported as failed
+  unsigned done;      // decode commands that finished
 };
 
-#define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
+#define FN(name) ((AVD_##name##_fn)d->s.accel->fn[AVD_FN_##name])
+
+static os_log_t vlog(void) {
+  static os_log_t l;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    l = os_log_create("com.droga.vtav1vcn", "driver");
+  });
+  return l;
+}
 
 // The parameter layouts were recovered from (and validated on the GPU against)
 // these exact builds of AMDRadeonVADriver2. Another build may lay them out
@@ -185,49 +193,26 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   // The driver takes width * height * 60 in 32 bits, and not 0.
   if (!maxWidth || !maxHeight || maxWidth > 8192 || maxHeight > 4352)
     FAIL("session size %ux%u out of range", maxWidth, maxHeight);
-  void* lib = dlopen(AVD_DRIVER_PATH, RTLD_NOW | RTLD_LOCAL);
-  if (!lib) FAIL("dlopen driver: %s", dlerror());
-  char uuid[33] = "unknown";
+  char why[200];
+  VcnDriverLib lib;
+  if (!vcn_driver_load(&lib, why, sizeof(why))) FAIL("%s", why);
   bool validated = false;
-  vcn_driver_uuid(uuid);
   for (size_t i = 0; i < sizeof(kValidatedDrivers) / sizeof(*kValidatedDrivers);
        i++)
-    if (!strcmp(uuid, kValidatedDrivers[i])) validated = true;
+    if (!strcmp(lib.uuid, kValidatedDrivers[i])) validated = true;
   const char* ov = getenv("VCNAV1_ALLOW_UNVALIDATED_DRIVER");
   if (!validated && !(ov && !strcmp(ov, "1")))
     FAIL(
         "AMDRadeonVADriver2 build %s not validated (dry-run it, then set "
         "VCNAV1_ALLOW_UNVALIDATED_DRIVER=1)",
-        uuid);
-  DBG("driver %s%s\n", uuid, validated ? " (validated)" : " (UNVALIDATED)");
-  AVD_CreateAVDAccelerator_fn create =
-      (AVD_CreateAVDAccelerator_fn)dlsym(lib, "AVD_CreateAVDAccelerator");
-  if (!create) FAIL("no AVD_CreateAVDAccelerator");
+        lib.uuid);
+  DBG("driver %s%s\n", lib.uuid, validated ? " (validated)" : " (UNVALIDATED)");
   io_service_t svc = vcn_find_accelerator();
   if (!svc) FAIL("no AMD accelerator");
-  d->svc = svc;
-  uint32_t services[8] = {svc};
-  AVD_AcceleratorCreate ac = {
-      .index = 0, .services = services, .validMask = 0xffffffff};
-  uint8_t info[256] = {0};
-  int r = create(&d->accel, &ac, info);
-  if (r || !d->accel) FAIL("CreateAVDAccelerator %d", r);
-  AVD_DriverCreate dc = {.initFlags = 0, .accel = d->accel};
-  r = FN(CreateDriver)(&d->drv, &dc);
-  if (r || !d->drv) FAIL("CreateDriver %d", r);
-  AVD_BitstreamPool pool = {.type = 0,
-                            .size = BS_SIZE,
-                            .format = 0x72617762,
-                            .one = 1,
-                            .count = NUM_BS,
-                            .addressesOut = d->bsAddr,
-                            .eight = 8,
-                            .five = 5};
-  r = FN(AllocateBitstreamBufferPool)(d->drv, &pool);
-  if (r) FAIL("AllocateBitstreamBufferPool %d", r);
-  // Frames go to the buffers in turn: every one of them must be there.
-  for (int i = 0; i < NUM_BS; i++)
-    if (!d->bsAddr[i]) FAIL("AllocateBitstreamBufferPool: no buffer %d", i);
+  // From here on, a failure closes everything opened so far, the accelerator
+  // included.
+  if (!vcn_session_open(&d->s, &lib, svc, vlog(), why, sizeof(why)))
+    FAIL("%s", why);
   AVD_ContextList list = {0};
   void* ctxOut[2] = {0};
   AVD_FunctionInfo* fis[1] = {&list.inlineInfo};
@@ -248,29 +233,19 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                                        .outFormat = 0x4e563132,
                                        .outFormatCount = 1};
   AVD_DriverContextInit ci = {.list = &list};
-  r = FN(CreateContexts)(d->drv, &ci);
+  int r = FN(CreateContexts)(d->s.drv, &ci);
   if (r || !ctxOut[0]) FAIL("CreateContexts(AV1) %d", r);
-  d->ctx = ctxOut[0];
-  DBG("created: drv=%p ctx=%p bs=%p\n", d->drv, d->ctx, d->bsAddr[0]);
+  d->s.ctx = ctxOut[0];
+  DBG("created: drv=%p ctx=%p bs=%p\n", d->s.drv, d->s.ctx, d->s.bsAddr[0]);
   return d;
 }
 
-void vcnav1_destroy(VcnAV1* d) {
-  if (!d) return;
-  if (d->ctx && d->drv && d->accel) {
-    void* ctxs[1] = {d->ctx};
-    AVD_DriverContextDelete del = {.count = 1, .contexts = ctxs};
-    FN(DeleteContexts)(d->drv, &del);
-  }
-  if (d->drv && d->accel) {
-    FN(FreeBitstreamBufferPool)(d->drv, 0);
-    FN(DeleteDriver)(d->drv);
-  }
+static void destroy_now(VcnAV1* d) {
+  vcn_session_close(&d->s);
+  // The pictures go after the driver: a stuck command may still write one.
   for (int i = 0; i < NUM_DPB; i++)
     if (d->dpb[i]) CVPixelBufferRelease(d->dpb[i]);
   if (d->pool) CVPixelBufferPoolRelease(d->pool);
-  // Released only after the driver is gone: it may hold on to the service.
-  if (d->svc) IOObjectRelease(d->svc);
   av1_parser_free(&d->parser);
   free(d->seq);
   free(d->frame);
@@ -278,9 +253,18 @@ void vcnav1_destroy(VcnAV1* d) {
   free(d);
 }
 
+void vcnav1_destroy(VcnAV1* d) {
+  if (!d) return;
+  vcn_teardown(d->stuck, vlog(), "AV1 session", ^{
+    destroy_now(d);
+  });
+}
+
 const char* vcnav1_last_error(VcnAV1* d) { return d ? d->err : ""; }
 
 unsigned vcnav1_firmware_errors(VcnAV1* d) { return d ? d->fwErrors : 0; }
+
+int vcnav1_failure(VcnAV1* d) { return d ? d->failure : VCNAV1_FAIL_DEVICE; }
 
 static inline void S32(uint8_t* base, int idx, int v) {
   ((int32_t*)base)[idx] = v;
@@ -495,29 +479,35 @@ static int submit(VcnAV1* d, AV1Params* prm) {
   if (!vcnav1_gpu_armed && (!arm || strcmp(arm, "yes-i-know-it-can-hang"))) {
     snprintf(d->err, sizeof(d->err),
              "GPU submission disabled (set VCNAV1_ALLOW_GPU)");
+    d->failure = VCNAV1_FAIL_DEVICE;
     return -1;
   }
   vcnav1_dryrun_checkpoint(prm);
   AVD_CmdInfo cmd = {.kind = 1,
                      .function = AVD_FUNC_AV1,
                      .mode = VCN_MODE_VCN0,
-                     .context = d->ctx,
+                     .context = d->s.ctx,
                      .params = prm};
   AVD_CmdInfo* cmds[1] = {&cmd};
   AVD_CmdList list = {.count = 1, .cmds = cmds};
   void* refcons[1] = {0};
   AVD_RefConList rl = {.count = 1, .refcons = refcons};
   double t0 = tnow_ms();
-  int r = FN(ScheduleAVDCommands)(d->drv, &list, &rl);
+  int r = FN(ScheduleAVDCommands)(d->s.drv, &list, &rl);
   double t1 = tnow_ms();
+  // A driver call that fails leaves the session in a state nothing has
+  // checked: no more commands go out, and VideoToolbox is told the decoder
+  // broke, not that the stream is bad, so it can use another one.
+  d->failure = VCNAV1_FAIL_DEVICE;
   if (r) {
+    d->broken = true;
     snprintf(d->err, sizeof(d->err), "ScheduleAVDCommands %d", r);
     return -1;
   }
   uint32_t fw = 0;
   int ds = 0;
   VcnWaitResult w =
-      vcn_wait_command(FN(QueryAVDCommandStatus), d->drv, refcons[0],
+      vcn_wait_command(FN(QueryAVDCommandStatus), d->s.drv, refcons[0],
                        VCN_COMMAND_TIMEOUT_MS, &fw, &ds);
   t_sched = t1 - t0;
   t_wait = tnow_ms() - t1;
@@ -525,19 +515,27 @@ static int submit(VcnAV1* d, AV1Params* prm) {
   if (w == VCN_WAIT_TIMEOUT) {
     // The GPU still holds this command. Sending more work, or reading the
     // target, could only make things worse: the session stops here.
-    d->stuck = true;
+    d->stuck = d->broken = true;
     snprintf(d->err, sizeof(d->err),
              "the GPU did not finish a frame in %d ms; session stopped",
              VCN_COMMAND_TIMEOUT_MS);
     return -1;
   }
   if (w != VCN_WAIT_DONE) {
+    d->broken = true;
     snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
     return -1;
   }
+  d->failure = VCNAV1_FAIL_STREAM;
+  d->done++;
   // Counted, not refused: what each firmware result means for the picture
-  // has not been checked on a GPU yet.
-  if (fw) d->fwErrors++;
+  // has not been checked on a GPU yet. The first one of a session is logged
+  // at once, the count goes in the stats line.
+  if (fw && !d->fwErrors++)
+    os_log_error(vlog(),
+                 "firmware result %u (0x%x) for decode %u of this session; "
+                 "later ones are counted in the stats line",
+                 fw, fw, d->done);
   return 0;
 }
 
@@ -613,6 +611,7 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   CVPixelBufferRef target = new_target(d, w, hh, tenBit);
   if (!target) {
     snprintf(d->err, sizeof(d->err), "no pixel buffer for %ux%u", w, hh);
+    d->failure = VCNAV1_FAIL_MEMORY;
     return -1;
   }
   if (d->dpb[slot]) CVPixelBufferRelease(d->dpb[slot]);
@@ -622,8 +621,8 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   // bitstream: concatenated tile data
   int bi = d->bsNext;
   d->bsNext = (d->bsNext + 1) % NUM_BS;
-  memcpy(d->bsAddr[bi], p->tile_data, p->tile_data_size);
-  memset((uint8_t*)d->bsAddr[bi] + p->tile_data_size, 0, 256);
+  memcpy(d->s.bsAddr[bi], p->tile_data, p->tile_data_size);
+  memset((uint8_t*)d->s.bsAddr[bi] + p->tile_data_size, 0, 256);
   memset(d->bsinfo, 0, BSINFO_BYTES);
   *(uint32_t*)(d->bsinfo + 0) = bi;
   *(uint32_t*)(d->bsinfo + 16) = (uint32_t)((p->tile_data_size + 127) & ~127u);
@@ -641,6 +640,7 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   prm.output = CVPixelBufferGetIOSurface(d->dpb[slot]);
   if (!prm.output) {
     snprintf(d->err, sizeof(d->err), "pixel buffer without an IOSurface");
+    d->failure = VCNAV1_FAIL_MEMORY;
     return -1;
   }
   // A reference slot the header emptied keeps its old DPB index, which may be
@@ -682,6 +682,7 @@ static int config_no_frames(void* vctx, AV1Parser* p, AV1ParseResult kind) {
 
 int vcnav1_configure(VcnAV1* d, const uint8_t* obus, size_t size) {
   d->err[0] = 0;
+  d->failure = VCNAV1_FAIL_STREAM;
   if (av1_parse_temporal_unit(&d->parser, obus, size, config_no_frames, d)) {
     if (!d->err[0]) snprintf(d->err, sizeof(d->err), "unreadable configOBUs");
     return -1;
@@ -702,9 +703,12 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
   d->outCtx = ctx;
   d->tag = userTag;
   d->err[0] = 0;
-  if (d->stuck) {
-    snprintf(d->err, sizeof(d->err),
-             "session stopped: the GPU did not finish an earlier frame");
+  d->failure = VCNAV1_FAIL_STREAM;
+  if (d->broken) {
+    snprintf(d->err, sizeof(d->err), "session stopped: %s",
+             d->stuck ? "the GPU did not finish an earlier frame"
+                      : "an earlier driver call failed");
+    d->failure = VCNAV1_FAIL_DEVICE;
     return -1;
   }
   int r = av1_parse_temporal_unit(&d->parser, tu, size, on_frame, d);

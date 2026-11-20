@@ -20,6 +20,9 @@ typedef void (*VcnAV1OutputFn)(void* ctx, CVPixelBufferRef frame,
 
 VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                       size_t errLen);
+// Closes the session and everything it holds of the driver. A session whose
+// last command never finished is closed on a background queue (the driver
+// waits for the GPU there); this returns at once.
 void vcnav1_destroy(VcnAV1* d);
 // Feed configuration OBUs (sequence header) e.g. from av1C. Returns 0, -1 when
 // they cannot be read (or hold a frame), or VCNAV1_UNSUPPORTED when the
@@ -33,6 +36,11 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
 // Drop all reference state (e.g. after a seek)
 void vcnav1_flush(VcnAV1* d);
 const char* vcnav1_last_error(VcnAV1* d);
+// What made the last configure or decode fail: the stream (it cannot be
+// decoded as it is), the device (a driver call failed or the GPU did not
+// finish a command; the session takes no more frames) or memory.
+enum { VCNAV1_FAIL_STREAM = 0, VCNAV1_FAIL_DEVICE = 1, VCNAV1_FAIL_MEMORY = 2 };
+int vcnav1_failure(VcnAV1* d);
 // Decodes the GPU firmware reported as failed (the picture was still output).
 unsigned vcnav1_firmware_errors(VcnAV1* d);
 // Attributes of the pixel buffers the decoder outputs (caller releases).

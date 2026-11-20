@@ -1,11 +1,10 @@
 #include "vcndriver.h"
 
+#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
-#include <mach/mach_time.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 
 bool vcn_codec_is_amd(CFTypeRef codec) {
   return codec && CFGetTypeID(codec) == CFStringGetTypeID() &&
@@ -56,50 +55,23 @@ bool vcn_driver_uuid(char out[33]) {
   return false;
 }
 
-static double wait_now_ms(void) {
-  static mach_timebase_info_data_t tb;
-  if (!tb.denom) mach_timebase_info(&tb);
-  return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
-}
-
-static int query_once(AVD_QueryAVDCommandStatus_fn query, void* driver,
-                      void* refcon, uint32_t wait, AVD_QueryEntry* qe) {
-  // +8 stays 1, the value sent before it was known to be unused.
-  *qe = (AVD_QueryEntry){.refcon = refcon, .unused8 = 1, .wait = wait};
-  AVD_QueryList ql = {.count = 1, .entries = qe};
-  return query(driver, &ql);
-}
-
-VcnWaitResult vcn_wait_command(AVD_QueryAVDCommandStatus_fn query, void* driver,
-                               void* refcon, unsigned timeoutMs,
-                               uint32_t* hwStatus, int* driverStatus) {
-  *hwStatus = 0;
-  *driverStatus = 0;
-  const double start = wait_now_ms();
-  AVD_QueryEntry qe;
-  for (;;) {
-    int r = query_once(query, driver, refcon, 0, &qe);
-    if (r) {
-      *driverStatus = r;
-      return VCN_WAIT_FAILED;
-    }
-    if (qe.status == 1) break;
-    if (qe.status != 2) {
-      *driverStatus = (int)qe.status;
-      return VCN_WAIT_FAILED;
-    }
-    if (wait_now_ms() - start >= timeoutMs) return VCN_WAIT_TIMEOUT;
-    // A frame takes milliseconds; a quarter of one between looks adds little
-    // latency and keeps the thread asleep most of the time.
-    usleep(250);
+bool vcn_driver_load(VcnDriverLib* lib, char* err, size_t errLen) {
+  *lib = (VcnDriverLib){.uuid = "unknown"};
+  // Never closed: dlclose would only drop the count dlopen raised, and the
+  // driver's code must stay while any session of this process uses it.
+  void* h = dlopen(AVD_DRIVER_PATH, RTLD_NOW | RTLD_LOCAL);
+  if (!h) {
+    snprintf(err, errLen, "dlopen driver: %s", dlerror());
+    return false;
   }
-  // Done: the blocking form now returns at once, runs the driver's steps after
-  // a decode and reports the firmware's result.
-  int r = query_once(query, driver, refcon, 1, &qe);
-  if (r) {
-    *driverStatus = r;
-    return VCN_WAIT_FAILED;
+  vcn_driver_uuid(lib->uuid);
+  lib->create =
+      (AVD_CreateAVDAccelerator_fn)dlsym(h, "AVD_CreateAVDAccelerator");
+  lib->destroy =
+      (AVD_DestroyAVDAccelerator_fn)dlsym(h, "AVD_DestroyAVDAccelerator");
+  if (!lib->create) {
+    snprintf(err, errLen, "no AVD_CreateAVDAccelerator");
+    return false;
   }
-  *hwStatus = qe.status2;
-  return VCN_WAIT_DONE;
+  return true;
 }

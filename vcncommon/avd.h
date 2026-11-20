@@ -136,6 +136,11 @@ typedef struct {
 typedef int (*AVD_CreateAVDAccelerator_fn)(AVD_Accelerator** out,
                                            AVD_AcceleratorCreate* in,
                                            void* info96);
+// Read in the 25G342 driver (IDA, 0x5D16C): releases what CreateAVDAccelerator
+// opened (its IOAccelDevice, IOAccelShared and IOAccelVideoContext, the
+// VAIOConnect and the AvdCapability) and frees the accelerator itself. Returns
+// 0. DeleteDriver releases none of it.
+typedef int (*AVD_DestroyAVDAccelerator_fn)(AVD_Accelerator* accel);
 typedef int (*AVD_CreateDriver_fn)(void** driver, AVD_DriverCreate* dc);
 typedef int (*AVD_CreateContexts_fn)(void* driver, AVD_DriverContextInit* init);
 typedef int (*AVD_DeleteContexts_fn)(void* driver,

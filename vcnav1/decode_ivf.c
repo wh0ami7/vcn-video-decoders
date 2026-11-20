@@ -20,6 +20,7 @@
 #include <string.h>
 
 #include "vcnav1.h"
+#include "vcndriver.h"
 
 typedef struct {
   int frames, mismatches;
@@ -254,6 +255,9 @@ int main(int argc, char** argv) {
 done:
   free(buf);
   vcnav1_destroy(d);
+  // A stuck session is closed on a background queue: wait for it, so its
+  // log lines are there before the program ends.
+  vcn_teardown_drain();
   if (c.out) fclose(c.out);
   if (c.md5) fclose(c.md5);
   if (fp) fclose(fp);

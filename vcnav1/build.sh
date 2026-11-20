@@ -14,7 +14,7 @@ CF=(-arch x86_64 -O1 -g -mmacosx-version-min=13.0 -Wall -Wextra -Wno-unused-para
 # -DVCN_DRYRUN_TOOLS adds the memory dump helpers tools/dryrun.py calls; the
 # plug-in is built without them.
 clang "${CF[@]}" -DVCN_DRYRUN_TOOLS -I../vcncommon av1parse.c vcnav1.c \
-  ../vcncommon/vcndriver.c decode_ivf.c \
+  ../vcncommon/vcndriver.c ../vcncommon/vcnsession.c decode_ivf.c \
   -framework IOKit -framework IOSurface -framework CoreFoundation -framework CoreVideo -o decode_ivf
 clang "${CF[@]}" -I. ../vtav1/vtav1test.c av1parse.c \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -o ../vtav1/vtav1test
@@ -22,5 +22,9 @@ clang "${CF[@]}" -I../vcncommon probe_ctx.c ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework IOKit -o probe_ctx
 clang "${CF[@]}" -I../vcncommon ../tools/driveruuid.c ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework IOKit -o ../tools/driveruuid
-codesign -f -s - decode_ivf ../vtav1/vtav1test probe_ctx ../tools/driveruuid
-echo "built decode_ivf, probe_ctx, ../tools/driveruuid and ../vtav1/vtav1test"
+# vtchurn opens many AV1 or VP9 sessions in one process and counts its ports and
+# IOKit connections. Every session decodes: it can hang the GPU like vtav1test.
+clang "${CF[@]}" ../tools/vtchurn.c -framework CoreFoundation -framework CoreMedia \
+  -framework CoreVideo -framework VideoToolbox -o ../tools/vtchurn
+codesign -f -s - decode_ivf ../vtav1/vtav1test probe_ctx ../tools/driveruuid ../tools/vtchurn
+echo "built decode_ivf, probe_ctx, ../tools/driveruuid, ../tools/vtchurn and ../vtav1/vtav1test"

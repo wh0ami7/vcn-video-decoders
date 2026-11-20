@@ -13,7 +13,10 @@
 //   6. a NULL sample is refused;
 //   7. after invalidate, frames are refused and nothing is emitted;
 //   8. (AV1) a sequence header in av1C that the engine cannot decode refuses
-//      the session.
+//      the session;
+//   9. a sample the decoder session fails as a device failure (a stuck GPU,
+//      a driver call that failed) is a malfunction, not bad data;
+//  10. after a start that fails, no format is accepted.
 //
 // usage: plugintest   (exit status 0 = pass)
 #include <signal.h>
@@ -89,17 +92,20 @@ OSStatus VTDecoderSessionEmitDecodedFrame(VTVideoDecoderSession session,
 // ---- stand-in decoder session
 // ------------------------------------------------- A sample's first byte says
 // what it does: 0 shows nothing, 1 shows a frame, 2 shows a frame and then
-// fails.
+// fails as a bad stream, 3 fails as a broken device.
 struct Fake {
   int unused;
 };
 static int creates, destroys;
+static bool failCreate;  // the next session start fails
+static int lastFailure;
 #if defined(TEST_AV1)
 static int configureResult;
 #endif
 static CVPixelBufferRef picture;
 
 static Vcn* fake_create(void) {
+  if (failCreate) return NULL;
   creates++;
   return (Vcn*)calloc(1, sizeof(struct Fake));
 }
@@ -135,8 +141,13 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t tag,
                   VcnAV1OutputFn fn, void* ctx) {
   (void)d, (void)size;
-  if (tu[0] >= 1) fn(ctx, picture, NULL, tag);
-  return tu[0] == 2 ? -1 : 0;
+  if (tu[0] == 1 || tu[0] == 2) fn(ctx, picture, NULL, tag);
+  lastFailure = tu[0] == 3 ? VCNAV1_FAIL_DEVICE : VCNAV1_FAIL_STREAM;
+  return tu[0] >= 2 ? -1 : 0;
+}
+int vcnav1_failure(VcnAV1* d) {
+  (void)d;
+  return lastFailure;
 }
 #else
 int vcnvp9_gpu_armed;
@@ -161,15 +172,21 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
                   VcnVP9OutputFn fn, void* ctx) {
   (void)d, (void)size;
-  if (chunk[0] >= 1) fn(ctx, picture, NULL, 16, 16, tag);
-  return chunk[0] == 2 ? -1 : 0;
+  if (chunk[0] == 1 || chunk[0] == 2) fn(ctx, picture, NULL, 16, 16, tag);
+  lastFailure = chunk[0] == 3 ? VCNVP9_FAIL_DEVICE : VCNVP9_FAIL_STREAM;
+  return chunk[0] >= 2 ? -1 : 0;
+}
+int vcnvp9_failure(VcnVP9* d) {
+  (void)d;
+  return lastFailure;
 }
 #endif
 
 // ---- helpers
 // ------------------------------------------------------------------
 static CMSampleBufferRef sample(uint8_t what) {
-  static uint8_t bytes[3][4] = {{0, 1, 2, 3}, {1, 1, 2, 3}, {2, 1, 2, 3}};
+  static uint8_t bytes[4][4] = {
+      {0, 1, 2, 3}, {1, 1, 2, 3}, {2, 1, 2, 3}, {3, 1, 2, 3}};
   CMBlockBufferRef bb = NULL;
   if (CMBlockBufferCreateWithMemoryBlock(NULL, bytes[what], 4, kCFAllocatorNull,
                                          NULL, 0, 4, 0, &bb))
@@ -228,6 +245,7 @@ static void hung(int sig) {
 }
 
 int main(void) {
+  int d0;
   signal(SIGALRM, hung);
   alarm(30);
   CVPixelBufferCreate(NULL, 16, 16,
@@ -260,7 +278,14 @@ int main(void) {
          emits == e + 2 && !lastStatus && emitDropped == 1 && emitImages == 1);
   dec_decode_frame(dec, NULL, broken, 0, NULL);
   expect("a sample that fails after showing a frame is an error, no picture",
-         emits == e + 3 && lastStatus && emitImages == 1);
+         emits == e + 3 && lastStatus == kVTVideoDecoderBadDataErr &&
+             emitImages == 1);
+  CMSampleBufferRef stuck = sample(3);
+  dec_decode_frame(dec, NULL, stuck, 0, NULL);
+  expect("a sample failed by a stuck GPU or a driver call is a malfunction",
+         emits == e + 4 && lastStatus == kVTVideoDecoderMalfunctionErr &&
+             emitImages == 1);
+  CFRelease(stuck);
 
   e = emits;
   inCallback = reenter;
@@ -285,6 +310,8 @@ int main(void) {
                               NULL) == kVTParameterErr);
 
   base_invalidate(obj);
+  expect("after invalidate the format is not accepted",
+         !dec_can_accept_format(dec, fmt));
   e = emits;
   OSStatus r1 = dec_decode_frame(dec, NULL, shown, 0, NULL),
            r2 = dec_decode_frame(dec, NULL, shown,
@@ -296,6 +323,26 @@ int main(void) {
              emits == e && destroys == creates);
   base_finalize(obj);
   free(obj);
+
+  expect("a decoder for the failed start test",
+         !CREATE(CODEC, NULL, &dec) && dec);
+  expect("its session starts", !dec_start_session(dec, NULL, fmt));
+  failCreate = true;
+  d0 = destroys;
+  expect(
+      "a second start whose session cannot be made fails",
+      dec_start_session(dec, NULL, fmt) == kVTVideoDecoderNotAvailableNowErr &&
+          destroys == d0 + 1);
+  failCreate = false;
+  expect("after a start that failed, the format is not accepted",
+         !dec_can_accept_format(dec, fmt));
+  e = emits;
+  OSStatus r3 = dec_decode_frame(dec, NULL, shown, 0, NULL);
+  expect("and a frame is refused as an invalid session",
+         !r3 && emits == e + 1 && lastStatus == kVTInvalidSessionErr);
+  base_invalidate((CMBaseObjectRef)dec);
+  base_finalize((CMBaseObjectRef)dec);
+  free(dec);
 
 #if defined(TEST_AV1)
   // av1C: marker/version, profile 0 level 0, 8-bit 4:2:0, then one config byte.

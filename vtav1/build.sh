@@ -15,7 +15,7 @@ clang -arch x86_64 -O2 -g -bundle -fvisibility=hidden -Wall -Wextra -Wno-unused-
   -fno-strict-overflow \
   -Wno-four-char-constants -Wno-deprecated-declarations -mmacosx-version-min=13.0 \
   -I../vcncommon AV1VCNDecoder.c ../vcnav1/vcnav1.c ../vcnav1/av1parse.c \
-  ../vcncommon/vcndriver.c \
+  ../vcncommon/vcndriver.c ../vcncommon/vcnsession.c \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
   -framework VideoToolbox -framework IOKit -framework IOSurface \
   -o "${B}/Contents/MacOS/AV1VCNDecoder"

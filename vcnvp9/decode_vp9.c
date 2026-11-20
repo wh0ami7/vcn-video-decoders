@@ -32,6 +32,7 @@
 #include <time.h>
 
 #include "container.h"
+#include "vcndriver.h"
 #include "vcnvp9.h"
 
 typedef struct {
@@ -358,6 +359,9 @@ int main(int argc, char** argv) {
 done:
   free(times);
   vcnvp9_destroy(d);
+  // A stuck session is closed on a background queue: wait for it, so its
+  // log lines are there before the program ends.
+  vcn_teardown_drain();
   if (c.ref) fclose(c.ref);
   container_close(&f);
   return exit_code;

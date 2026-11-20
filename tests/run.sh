@@ -68,6 +68,15 @@ check "the plug-ins' VideoToolbox side, with a stand-in decoder" plugins
 
 check "only AMD's accelerator is taken" "${B}/acceltest"
 check "a decode command that never finishes times out" "${B}/waittest"
+sessions() {
+  "${B}/sessiontest-av1" media/av1/av1-1-b8-01-size-16x16.ivf \
+    > "${B}/sessiontest-av1.txt" &&
+    "${B}/sessiontest-vp9" media/vp9/vp90-2-12-droppable_1.ivf \
+      > "${B}/sessiontest-vp9.txt" ||
+    { cat "${B}/sessiontest-av1.txt" "${B}/sessiontest-vp9.txt" 2>/dev/null |
+        grep -v ^PASS; return 1; }
+}
+check "decoder sessions release the driver once, also after failures and a stuck GPU (made-up driver)" sessions
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"

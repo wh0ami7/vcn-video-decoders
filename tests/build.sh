@@ -26,6 +26,13 @@ for c in av1 vp9; do
 done
 xcrun clang "${TFLAGS[@]}" -I../vcncommon acceltest.c ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework IOKit -o "${B}/acceltest"
-xcrun clang "${TFLAGS[@]}" -I../vcncommon waittest.c ../vcncommon/vcndriver.c \
+xcrun clang "${TFLAGS[@]}" -I../vcncommon waittest.c ../vcncommon/vcnsession.c \
   -framework CoreFoundation -framework IOKit -o "${B}/waittest"
+# The decoder sessions against a made-up driver: sessiontest.c stands in for
+for c in av1 vp9; do
+  xcrun clang "${TFLAGS[@]}" -DTEST_${(U)c} -I../vcncommon -I../vcn${c} \
+    sessiontest.c ../vcn${c}/vcn${c}.c ../vcn${c}/${c}parse.c \
+    ../vcncommon/vcnsession.c -framework CoreFoundation -framework CoreVideo \
+    -framework IOKit -framework IOSurface -o "${B}/sessiontest-${c}"
+done
 echo "built the tests in tests/${B}"

@@ -18,6 +18,7 @@ build/
 /vtvp9/vtvp9test
 /vcnav1/probe_ctx
 /tools/driveruuid
+/tools/vtchurn
 
 # Reverse-engineering and local test material
 .re/

@@ -28,10 +28,18 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 
 VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                       size_t errLen);
+// Closes the session and everything it holds of the driver. A session whose
+// last command never finished is closed on a background queue (the driver
+// waits for the GPU there); this returns at once.
 void vcnvp9_destroy(VcnVP9* d);
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
                   VcnVP9OutputFn fn, void* ctx);
 const char* vcnvp9_last_error(VcnVP9* d);
+// What made the last decode fail: the stream (it cannot be decoded as it is),
+// the device (a driver call failed or the GPU did not finish a command; the
+// session takes no more frames) or memory.
+enum { VCNVP9_FAIL_STREAM = 0, VCNVP9_FAIL_DEVICE = 1, VCNVP9_FAIL_MEMORY = 2 };
+int vcnvp9_failure(VcnVP9* d);
 // Decodes the GPU firmware reported as failed (the picture was still output).
 unsigned vcnvp9_firmware_errors(VcnVP9* d);
 

@@ -3,7 +3,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
-#include <dlfcn.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +26,8 @@ int vcnvp9_gpu_armed = 0;
 #define VCN_MODE_VCN0 \
   4  // VP9 runs on both instances, but AV1 contexts only work on VCN0
 #define NUM_DPB 9
-#define NUM_BS 4
-#define BS_SIZE 0x1800000u
+#define NUM_BS VCN_NUM_BS
+#define BS_SIZE VCN_BS_SIZE
 #define FRAME_BYTES 4096
 #define SEQ_BYTES 2048
 #define BSINFO_BYTES (20 + 64 * 512 + 64)
@@ -52,13 +52,9 @@ typedef struct {
 } VP9Params;
 
 struct VcnVP9 {
-  AVD_Accelerator* accel;
-  void* drv;
-  void* ctx;
-  void* bsAddr[NUM_BS];
+  VcnDriverSession s;  // accelerator, driver, context and bitstream pool
   int bsNext;
   uint32_t maxW, maxH;
-  io_service_t svc;  // the accelerator handed to the driver; ours to release
   VP9Parser parser;
   CVPixelBufferRef dpb[NUM_DPB];
   int dpbRefs[NUM_DPB];
@@ -70,11 +66,23 @@ struct VcnVP9 {
   CVPixelBufferPoolRef pool;
   uint32_t poolW, poolH;
   bool poolTen;
-  bool stuck;         // a command never finished: nothing more goes out
+  bool stuck;         // a command never finished: the GPU may still hold it
+  bool broken;        // stuck, or a driver call failed: nothing more goes out
+  int failure;        // VCNVP9_FAIL_* of the last error
   unsigned fwErrors;  // decodes the firmware reported as failed
+  unsigned done;      // decode commands that finished
 };
 
-#define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
+#define FN(name) ((AVD_##name##_fn)d->s.accel->fn[AVD_FN_##name])
+
+static os_log_t vlog(void) {
+  static os_log_t l;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    l = os_log_create("com.droga.vtvp9vcn", "driver");
+  });
+  return l;
+}
 
 // Every offset below was read from the 26.7.2 database, whose decoder code
 // matches 26.7.1. The Sequoia driver was compared against it in IDA: same
@@ -156,7 +164,7 @@ static uint32_t al(uint32_t v, uint32_t a) { return (v + a - 1) & ~(a - 1); }
 static uint32_t dpb_alignment(uint32_t width) { return width <= 32 ? 32 : 64; }
 
 static int g_session_is_vp9;  // process wide on purpose: only the dry run ever
-                              // sets it to 0
+                              // sets it to 0; written and read atomically
 static void* g_vt[VT_SLOTS + 2];
 static void** g_orig;
 static __thread int t_creating;
@@ -178,7 +186,8 @@ __attribute__((noinline)) void vcnvp9_message_built(const void* data) {
 static int hook_create_session(uint8_t* proc, void* bi) {
   int r = ((int (*)(void*, void*))g_orig[VT_CREATE_SESSION])(proc, bi);
   uint8_t* msg = DATA_MSG(DEC_DATA(PROC_DECODER(proc)));
-  if (!r && g_session_is_vp9) U32(msg, 40) = VCN_CODEC_VP9;
+  if (!r && __atomic_load_n(&g_session_is_vp9, __ATOMIC_RELAXED))
+    U32(msg, 40) = VCN_CODEC_VP9;
   vcnvp9_session_message(msg);
   return r;
 }
@@ -423,8 +432,15 @@ static void* hook_create_processor(void* factory, int type, void* decoder) {
   if (proc && type == AV1_PROCESSOR_TYPE && t_creating) {
     void** vt = *(void***)proc;
     if (!g_class_vt) g_class_vt = vt;
-    if (vt != g_class_vt)
-      abort();  // something else where AV1's class should be: never continue
+    if (vt != g_class_vt) {
+      // Something else where AV1's class should be: never continue, but say
+      // so first, or the crash report is all there is.
+      os_log_fault(vlog(),
+                   "the driver's AV1 processor class changed (%p, was %p): "
+                   "stopping the process",
+                   (void*)vt, (void*)g_class_vt);
+      abort();
+    }
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, init_vt);
     *proc = (void*)&g_vt[2];
@@ -546,45 +562,22 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
     FAIL("GPU submission disabled (set VCNVP9_ALLOW_GPU or use the dry run)");
   if (!strcmp(sess, "av1") && !traced)
     FAIL("VCNVP9_SESSION=av1 is only for the dry run");
-  g_session_is_vp9 = !strcmp(sess, "vp9");
-  void* lib = dlopen(AVD_DRIVER_PATH, RTLD_NOW | RTLD_LOCAL);
-  if (!lib) FAIL("dlopen driver: %s", dlerror());
-  char uuid[33] = "unknown";
+  __atomic_store_n(&g_session_is_vp9, !strcmp(sess, "vp9"), __ATOMIC_RELAXED);
+  char why[200];
+  VcnDriverLib lib;
+  if (!vcn_driver_load(&lib, why, sizeof(why))) FAIL("%s", why);
   bool validated = false;
-  vcn_driver_uuid(uuid);
   for (size_t i = 0; i < sizeof(kValidatedDrivers) / sizeof(*kValidatedDrivers);
        i++)
-    if (!strcmp(uuid, kValidatedDrivers[i])) validated = true;
+    if (!strcmp(lib.uuid, kValidatedDrivers[i])) validated = true;
   if (!validated)
-    FAIL("AMDRadeonVADriver2 build %s not validated for VP9", uuid);
-  AVD_CreateAVDAccelerator_fn create =
-      (AVD_CreateAVDAccelerator_fn)dlsym(lib, "AVD_CreateAVDAccelerator");
-  if (!create) FAIL("no AVD_CreateAVDAccelerator");
+    FAIL("AMDRadeonVADriver2 build %s not validated for VP9", lib.uuid);
   io_service_t svc = vcn_find_accelerator();
   if (!svc) FAIL("no AMD accelerator");
-  d->svc = svc;
-  uint32_t services[8] = {svc};
-  AVD_AcceleratorCreate ac = {
-      .index = 0, .services = services, .validMask = 0xffffffff};
-  uint8_t info[256] = {0};
-  int r = create(&d->accel, &ac, info);
-  if (r || !d->accel) FAIL("CreateAVDAccelerator %d", r);
-  AVD_DriverCreate dc = {.initFlags = 0, .accel = d->accel};
-  r = FN(CreateDriver)(&d->drv, &dc);
-  if (r || !d->drv) FAIL("CreateDriver %d", r);
-  AVD_BitstreamPool pool = {.type = 0,
-                            .size = BS_SIZE,
-                            .format = 0x72617762,
-                            .one = 1,
-                            .count = NUM_BS,
-                            .addressesOut = d->bsAddr,
-                            .eight = 8,
-                            .five = 5};
-  r = FN(AllocateBitstreamBufferPool)(d->drv, &pool);
-  if (r) FAIL("AllocateBitstreamBufferPool %d", r);
-  // Frames go to the buffers in turn: every one of them must be there.
-  for (int i = 0; i < NUM_BS; i++)
-    if (!d->bsAddr[i]) FAIL("AllocateBitstreamBufferPool: no buffer %d", i);
+  // From here on, a failure closes everything opened so far, the accelerator
+  // included.
+  if (!vcn_session_open(&d->s, &lib, svc, vlog(), why, sizeof(why)))
+    FAIL("%s", why);
   AVD_ContextList list = {0};
   void* ctxOut[2] = {0};
   AVD_FunctionInfo* fis[1] = {&list.inlineInfo};
@@ -605,55 +598,66 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   // Swap the vtable pointer on this driver's factory, only for the length of
   // CreateContexts.
   static pthread_mutex_t create_lock = PTHREAD_MUTEX_INITIALIZER;
-  uint8_t* va = PTR(d->drv, 8);
+  // The wrapped copy of the factory's class vtable. Built once, under
+  // create_lock, before any factory points at it: threads of other sessions
+  // may read it at any time once it is published, so it never changes again.
+  static void* factoryVt[FACTORY_SLOTS + 2];
+  static void** factoryOrigVt;
+  uint8_t* va = PTR(d->s.drv, 8);
   void*** factory = (void***)PTR(va, 75072);
   if (!factory || !*factory) FAIL("no factory");
   vcnvp9_dryrun_checkpoint(1);
   pthread_mutex_lock(&create_lock);
   void** origFactoryVt = *factory;
-  static void* factoryVt[FACTORY_SLOTS + 2];
-  memcpy(factoryVt, origFactoryVt - 2, sizeof(factoryVt));
-  g_orig_create_processor =
-      (void* (*)(void*, int, void*))origFactoryVt[FACTORY_CREATE_PROCESSOR];
-  factoryVt[2 + FACTORY_CREATE_PROCESSOR] = (void*)hook_create_processor;
-  *factory = &factoryVt[2];
+  if (!factoryOrigVt) {
+    memcpy(factoryVt, origFactoryVt - 2, sizeof(factoryVt));
+    g_orig_create_processor =
+        (void* (*)(void*, int, void*))origFactoryVt[FACTORY_CREATE_PROCESSOR];
+    factoryVt[2 + FACTORY_CREATE_PROCESSOR] = (void*)hook_create_processor;
+    factoryOrigVt = origFactoryVt;
+  }
+  if (origFactoryVt != factoryOrigVt) {
+    pthread_mutex_unlock(&create_lock);
+    FAIL("the driver's factory class changed (%p, was %p)",
+         (void*)origFactoryVt, (void*)factoryOrigVt);
+  }
+  __atomic_store_n(factory, &factoryVt[2], __ATOMIC_RELEASE);
   t_creating = 1;
-  r = FN(CreateContexts)(d->drv, &ci);
+  int r = FN(CreateContexts)(d->s.drv, &ci);
   t_creating = 0;
-  *factory = origFactoryVt;
+  __atomic_store_n(factory, origFactoryVt, __ATOMIC_RELEASE);
   pthread_mutex_unlock(&create_lock);
   if (r || !ctxOut[0]) FAIL("CreateContexts %d", r);
-  d->ctx = ctxOut[0];
-  DBG("created: driver %s session=%s drv=%p ctx=%p\n", uuid, sess, d->drv,
-      d->ctx);
+  d->s.ctx = ctxOut[0];
+  DBG("created: driver %s session=%s drv=%p ctx=%p\n", lib.uuid, sess, d->s.drv,
+      d->s.ctx);
   return d;
 }
 
-void vcnvp9_destroy(VcnVP9* d) {
-  if (!d) return;
-  if (d->ctx && d->drv && d->accel) {
-    void* ctxs[1] = {d->ctx};
-    AVD_DriverContextDelete del = {.count = 1, .contexts = ctxs};
-    FN(DeleteContexts)(d->drv, &del);
-  }
-  if (d->drv && d->accel) {
-    FN(FreeBitstreamBufferPool)(d->drv, 0);
-    FN(DeleteDriver)(d->drv);
-  }
+static void destroy_now(VcnVP9* d) {
+  vcn_session_close(&d->s);
+  // The pictures go after the driver: a stuck command may still write one.
   for (int i = 0; i < NUM_DPB; i++)
     if (d->dpb[i]) CVPixelBufferRelease(d->dpb[i]);
   if (d->pool) CVPixelBufferPoolRelease(d->pool);
-  // Released only after the driver is gone: it may hold on to the service.
-  if (d->svc) IOObjectRelease(d->svc);
   free(d->seq);
   free(d->frame);
   free(d->bsinfo);
   free(d);
 }
 
+void vcnvp9_destroy(VcnVP9* d) {
+  if (!d) return;
+  vcn_teardown(d->stuck, vlog(), "VP9 session", ^{
+    destroy_now(d);
+  });
+}
+
 const char* vcnvp9_last_error(VcnVP9* d) { return d ? d->err : ""; }
 
 unsigned vcnvp9_firmware_errors(VcnVP9* d) { return d ? d->fwErrors : 0; }
+
+int vcnvp9_failure(VcnVP9* d) { return d ? d->failure : VCNVP9_FAIL_DEVICE; }
 
 static int alloc_dpb_slot(VcnVP9* d) {
   for (int i = 0; i < NUM_DPB; i++)
@@ -673,38 +677,52 @@ static int submit(VcnVP9* d, VP9Params* prm) {
   AVD_CmdInfo cmd = {.kind = 1,
                      .function = AVD_FUNC_AV1,
                      .mode = VCN_MODE_VCN0,
-                     .context = d->ctx,
+                     .context = d->s.ctx,
                      .params = prm};
   AVD_CmdInfo* cmds[1] = {&cmd};
   AVD_CmdList list = {.count = 1, .cmds = cmds};
   void* refcons[1] = {0};
   AVD_RefConList rl = {.count = 1, .refcons = refcons};
-  int r = FN(ScheduleAVDCommands)(d->drv, &list, &rl);
+  int r = FN(ScheduleAVDCommands)(d->s.drv, &list, &rl);
+  // A driver call that fails leaves the session in a state nothing has
+  // checked: no more commands go out, and VideoToolbox is told the decoder
+  // broke, not that the stream is bad, so it can use another one.
+  d->failure = VCNVP9_FAIL_DEVICE;
   if (r) {
+    d->broken = true;
     snprintf(d->err, sizeof(d->err), "ScheduleAVDCommands %d", r);
     return -1;
   }
   uint32_t fw = 0;
   int ds = 0;
   VcnWaitResult w =
-      vcn_wait_command(FN(QueryAVDCommandStatus), d->drv, refcons[0],
+      vcn_wait_command(FN(QueryAVDCommandStatus), d->s.drv, refcons[0],
                        VCN_COMMAND_TIMEOUT_MS, &fw, &ds);
   if (w == VCN_WAIT_TIMEOUT) {
     // The GPU still holds this command. Sending more work, or reading the
     // target, could only make things worse: the session stops here.
-    d->stuck = true;
+    d->stuck = d->broken = true;
     snprintf(d->err, sizeof(d->err),
              "the GPU did not finish a frame in %d ms; session stopped",
              VCN_COMMAND_TIMEOUT_MS);
     return -1;
   }
   if (w != VCN_WAIT_DONE) {
+    d->broken = true;
     snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
     return -1;
   }
+  d->failure = VCNVP9_FAIL_STREAM;
+  d->done++;
   // Counted, not refused: the VP9 result goes through the AV1 processor's
   // status reader, and what it reports for VP9 has not been checked on a GPU.
-  if (fw) d->fwErrors++;
+  // The first one of a session is logged at once, the count goes in the stats
+  // line.
+  if (fw && !d->fwErrors++)
+    os_log_error(vlog(),
+                 "firmware result %u (0x%x) for decode %u of this session; "
+                 "later ones are counted in the stats line",
+                 fw, fw, d->done);
   return 0;
 }
 
@@ -764,14 +782,15 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
   if (!target) {
     snprintf(d->err, sizeof(d->err), "no pixel buffer for %ux%u", h->width,
              h->height);
+    d->failure = VCNVP9_FAIL_MEMORY;
     return -1;
   }
   if (d->dpb[slot]) CVPixelBufferRelease(d->dpb[slot]);
   d->dpb[slot] = target;
   int bi = d->bsNext;
   d->bsNext = (d->bsNext + 1) % NUM_BS;
-  memcpy(d->bsAddr[bi], data, size);
-  memset((uint8_t*)d->bsAddr[bi] + size, 0, 256);
+  memcpy(d->s.bsAddr[bi], data, size);
+  memset((uint8_t*)d->s.bsAddr[bi] + size, 0, 256);
   memset(d->bsinfo, 0, BSINFO_BYTES);
   *(uint32_t*)(d->bsinfo + 0) = (uint32_t)bi;
   *(uint32_t*)(d->bsinfo + 16) = al((uint32_t)size, 128);
@@ -789,6 +808,7 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
   prm.output = CVPixelBufferGetIOSurface(target);
   if (!prm.output) {
     snprintf(d->err, sizeof(d->err), "pixel buffer without an IOSurface");
+    d->failure = VCNVP9_FAIL_MEMORY;
     return -1;
   }
   prm.bsinfo = d->bsinfo;
@@ -820,9 +840,12 @@ int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
   d->outCtx = ctx;
   d->tag = tag;
   d->err[0] = 0;
-  if (d->stuck) {
-    snprintf(d->err, sizeof(d->err),
-             "session stopped: the GPU did not finish an earlier frame");
+  d->failure = VCNVP9_FAIL_STREAM;
+  if (d->broken) {
+    snprintf(d->err, sizeof(d->err), "session stopped: %s",
+             d->stuck ? "the GPU did not finish an earlier frame"
+                      : "an earlier driver call failed");
+    d->failure = VCNVP9_FAIL_DEVICE;
     return -1;
   }
   int r = vp9_parse_chunk(&d->parser, chunk, size, on_frame, d);

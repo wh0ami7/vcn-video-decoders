@@ -121,6 +121,24 @@ static os_log_t logger(void) {
   return l;
 }
 
+// Driver sessions of this plug-in in this process, for the log: a host that
+// keeps creating sessions without ending them shows up as a growing "live".
+static long g_started, g_ended;
+
+// Ends the decoder session, if there is one, and logs it with the counts. The
+// caller holds s->lock or is the only one left using s.
+static void end_session(Storage* s, const char* why) {
+  if (!s->vcn) return;
+  vcnav1_destroy(s->vcn);
+  s->vcn = NULL;
+  long ended = __atomic_add_fetch(&g_ended, 1, __ATOMIC_RELAXED),
+       started = __atomic_load_n(&g_started, __ATOMIC_RELAXED);
+  os_log_info(logger(),
+              "session %dx%d ended (%{public}s): %ld started, %ld ended, %ld "
+              "live in this process",
+              s->width, s->height, why, started, ended, started - ended);
+}
+
 static Storage* storage_of(VTVideoDecoderRef dec) {
   return CMBaseObjectGetDerivedStorage(VTVideoDecoderGetCMBaseObject(dec));
 }
@@ -164,10 +182,7 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
   pthread_mutex_lock(&s->lock);
   // Frames handed in from now on are refused, and none is emitted any more.
   __atomic_store_n(&s->invalidated, true, __ATOMIC_RELAXED);
-  if (s->vcn) {
-    vcnav1_destroy(s->vcn);
-    s->vcn = NULL;
-  }
+  end_session(s, "invalidated");
   pthread_mutex_unlock(&s->lock);
   return noErr;
 }
@@ -175,7 +190,7 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
 static void base_finalize(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
   drain(s);
-  if (s->vcn) vcnav1_destroy(s->vcn);
+  end_session(s, "finalized");
   if (s->format) CFRelease(s->format);
   if (s->queue) dispatch_release(s->queue);
   if (s->slots) dispatch_release(s->slots);
@@ -217,14 +232,13 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
   // A second start replaces the decoder of the first one.
   drain(s);
   pthread_mutex_lock(&s->lock);
-  if (s->vcn) {
-    vcnav1_destroy(s->vcn);
-    s->vcn = NULL;
-  }
-  pthread_mutex_unlock(&s->lock);
-  s->session = session;
+  end_session(s, "replaced by a new start");
+  // Kept only once the new session runs: a start that fails must leave no
+  // format that canAcceptFormatDescription could match.
   if (s->format) CFRelease(s->format);
-  s->format = (CMVideoFormatDescriptionRef)CFRetain(fmt);
+  s->format = NULL;
+  s->session = session;
+  pthread_mutex_unlock(&s->lock);
   s->width = dim.width;
   s->height = dim.height;
   s->tenBit = false;
@@ -255,12 +269,16 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
   }
   char err[256] = "";
   vcnav1_gpu_armed = 1;
-  s->vcn = vcnav1_create(maxW, maxH, err, sizeof(err));
-  if (!s->vcn) {
+  VcnAV1* vcn = vcnav1_create(maxW, maxH, err, sizeof(err));
+  if (!vcn) {
     os_log_error(logger(), "vcnav1_create: %{public}s", err);
     if (av1C) CFRelease(av1C);
     return kVTVideoDecoderNotAvailableNowErr;
   }
+  pthread_mutex_lock(&s->lock);
+  s->vcn = vcn;
+  __atomic_add_fetch(&g_started, 1, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&s->lock);
   int cr =
       cfg && cfgLen > 4 ? vcnav1_configure(s->vcn, cfg + 4, cfgLen - 4) : 0;
   if (cr)
@@ -270,22 +288,32 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
   // A sequence header the engine cannot decode: VideoToolbox can pick another
   // decoder.
   if (cr == VCNAV1_UNSUPPORTED) {
-    vcnav1_destroy(s->vcn);
-    s->vcn = NULL;
+    pthread_mutex_lock(&s->lock);
+    end_session(s, "unsupported sequence header");
+    pthread_mutex_unlock(&s->lock);
     return kVTVideoDecoderUnsupportedDataFormatErr;
   }
 
   CFDictionaryRef attrs =
       vcnav1_copy_pixel_buffer_attributes(s->width, s->height, s->tenBit);
   if (!attrs) {  // out of memory: no session rather than one with no attributes
-    vcnav1_destroy(s->vcn);
-    s->vcn = NULL;
+    pthread_mutex_lock(&s->lock);
+    end_session(s, "out of memory");
+    pthread_mutex_unlock(&s->lock);
     return kVTAllocationFailedErr;
   }
   VTDecoderSessionSetPixelBufferAttributes(session, attrs);
   CFRelease(attrs);
-  os_log(logger(), "session %dx%d %{public}s", s->width, s->height,
-         s->tenBit ? "10-bit" : "8-bit");
+  pthread_mutex_lock(&s->lock);
+  s->format = (CMVideoFormatDescriptionRef)CFRetain(fmt);
+  pthread_mutex_unlock(&s->lock);
+  long started = __atomic_load_n(&g_started, __ATOMIC_RELAXED),
+       ended = __atomic_load_n(&g_ended, __ATOMIC_RELAXED);
+  os_log(logger(),
+         "session %dx%d %{public}s: %ld started, %ld ended, %ld live in this "
+         "process",
+         s->width, s->height, s->tenBit ? "10-bit" : "8-bit", started, ended,
+         started - ended);
   return noErr;
 }
 
@@ -330,6 +358,21 @@ static void stats_add(Storage* s, double queued, double decode) {
 // the session code) cannot be decoded: refuse it before copying anything.
 enum { kMaxSampleBytes = 0x1800000 };
 
+// What VideoToolbox is told when a sample fails. A broken session (a driver
+// call failed, or the GPU did not finish a command) is a malfunction, so that
+// the host can fall back to another decoder; bad data is kept for streams
+// that cannot be decoded as they are.
+static OSStatus decode_status(int failure) {
+  switch (failure) {
+    case VCNAV1_FAIL_DEVICE:
+      return kVTVideoDecoderMalfunctionErr;
+    case VCNAV1_FAIL_MEMORY:
+      return kVTAllocationFailedErr;
+    default:
+      return kVTVideoDecoderBadDataErr;
+  }
+}
+
 // Decode one temporal unit and hand its shown frame to VideoToolbox.
 static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
                             CMSampleBufferRef sbuf, double enqueued) {
@@ -345,7 +388,9 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
            !CMBlockBufferGetDataPointer(bb, 0, NULL, NULL, &ptr) && ptr) {
   } else {
     copy = malloc(len);
-    if (!copy || CMBlockBufferCopyDataBytes(bb, 0, len, copy))
+    if (!copy)
+      status = kVTAllocationFailedErr;
+    else if (CMBlockBufferCopyDataBytes(bb, 0, len, copy))
       status = kVTVideoDecoderBadDataErr;
     ptr = (char*)copy;
   }
@@ -357,7 +402,7 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
   if (!status &&
       vcnav1_decode(s->vcn, (const uint8_t*)ptr, len, 0, on_output, s)) {
     os_log_error(logger(), "decode: %{public}s", vcnav1_last_error(s->vcn));
-    status = kVTVideoDecoderBadDataErr;
+    status = decode_status(vcnav1_failure(s->vcn));
   }
   CVPixelBufferRef out = s->lastFrame;
   s->lastFrame = NULL;
@@ -438,17 +483,26 @@ static OSStatus dec_copy_supported_properties(VTVideoDecoderRef dec,
 static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
                                      CMFormatDescriptionRef fmt) {
   Storage* s = storage_of(dec);
-  if (!s->format || !fmt ||
-      CMFormatDescriptionGetMediaSubType(fmt) !=
-          CMFormatDescriptionGetMediaSubType(s->format))
-    return false;
-  CMVideoDimensions a = CMVideoFormatDescriptionGetDimensions(s->format),
+  if (!fmt) return false;
+  // A decoder whose start failed, whose session broke down to nothing or that
+  // was invalidated takes no format: VideoToolbox must make a new one.
+  pthread_mutex_lock(&s->lock);
+  CMFormatDescriptionRef cur =
+      s->vcn && !s->invalidated && s->format ? CFRetain(s->format) : NULL;
+  pthread_mutex_unlock(&s->lock);
+  if (!cur) return false;
+  Boolean same = false;
+  CMVideoDimensions a = CMVideoFormatDescriptionGetDimensions(cur),
                     b = CMVideoFormatDescriptionGetDimensions(fmt);
-  if (a.width != b.width || a.height != b.height) return false;
-  CFDataRef x = copy_av1C(s->format), y = copy_av1C(fmt);
-  Boolean same = (!x && !y) || (x && y && CFEqual(x, y));
-  if (x) CFRelease(x);
-  if (y) CFRelease(y);
+  if (CMFormatDescriptionGetMediaSubType(fmt) ==
+          CMFormatDescriptionGetMediaSubType(cur) &&
+      a.width == b.width && a.height == b.height) {
+    CFDataRef x = copy_av1C(cur), y = copy_av1C(fmt);
+    same = (!x && !y) || (x && y && CFEqual(x, y));
+    if (x) CFRelease(x);
+    if (y) CFRelease(y);
+  }
+  CFRelease(cur);
   return same;
 }
 
