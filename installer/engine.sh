@@ -27,6 +27,8 @@
 #
 set -u
 emulate -L zsh
+# sudo keeps the caller's PATH on macOS: only the system's own tools, whatever is in it
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 SELF_DIR=${0:A:h}
 RES=${VCNVT_RES:-$SELF_DIR}
@@ -248,8 +250,6 @@ restore_apple_plugins() { # src-dir dst-dir
   echo "Apple plug-ins OK: ${#apple} present, $n restored"
 }
 
-SEALMNT=/private/var/tmp/vcn-sealed-snapshot
-
 do_repair() {
   [[ $EUID -eq 0 ]] || { echo "repair must run as root" >&2; exit 1; }
   preflight
@@ -259,13 +259,18 @@ do_repair() {
   seal=$(diskutil apfs listSnapshots "$vol" 2>/dev/null | awk -F': *' '/Name:/{print $2}' | grep -m1 '^com\.apple\.os\.update-')
   [[ -n "$seal" ]] || { echo "Apple's original system snapshot was not found on $vol" >&2; exit 5; }
   mount_system || exit 1
-  mkdir -p "$SEALMNT"
-  mount | grep -q " on $SEALMNT " || mount_apfs -s "$seal" -o rdonly,nobrowse "$vol" "$SEALMNT" \
-    || { echo "could not mount $seal" >&2; exit 5; }
+  # A new root-owned folder for every repair. A fixed name in /private/var/tmp, which every
+  # user can write, let another user mount a disk image of their own there first: the old
+  # code then skipped the mount and copied that image's "Apple" plug-ins onto /System.
+  local sealmnt
+  sealmnt=$(mktemp -d /private/var/tmp/vcn-sealed-snapshot.XXXXXX) \
+    || { echo "could not make a mount point for $seal" >&2; exit 5; }
+  mount_apfs -s "$seal" -o rdonly,nobrowse "$vol" "$sealmnt" \
+    || { rmdir "$sealmnt"; echo "could not mount $seal" >&2; exit 5; }
   echo "pristine source: $seal"
-  restore_apple_plugins "$SEALMNT/$PLUGDIR" "$MNT/$PLUGDIR"
+  restore_apple_plugins "$sealmnt/$PLUGDIR" "$MNT/$PLUGDIR"
   local rc=$?
-  umount "$SEALMNT" 2>/dev/null
+  umount "$sealmnt" 2>/dev/null && rmdir "$sealmnt"
   [[ $rc -eq 0 ]] || exit 6
   # install our decoders in the same snapshot (one reboot), unless the build is unvalidated
   if [[ $SOFT_FAIL -eq 0 || $FORCE -eq 1 ]]; then
@@ -302,8 +307,9 @@ install_one() { # src-bundle-dir  name
   safe_rm_bundle "$dest" || return 1
   ditto "$src" "$dest" || return 1
   for d in "$dest"/Contents/MacOS/*.dSYM(N); do rm -rf -- "$d"; done
-  # a downloaded installer is quarantined and ditto would carry that onto the system copy
-  xattr -dr com.apple.quarantine "$dest" 2>/dev/null
+  # a downloaded installer is quarantined and ditto would carry that onto the system copy.
+  # -s: act on a link itself, never on what it points to (this runs as root).
+  xattr -drs com.apple.quarantine "$dest" 2>/dev/null
   chown -R root:wheel "$dest"
   chmod -R go-w "$dest"
   # verify it landed where VideoToolbox looks
