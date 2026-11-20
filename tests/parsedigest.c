@@ -183,6 +183,7 @@ static int mutate_file(const char* path, unsigned rounds) {
     return 1;
   }
   unsigned refused = 0;
+  if (size <= 32) rounds = 0;  // only the IVF header: nothing to damage
   for (unsigned i = 0; i < rounds; i++) {
     memcpy(copy, data, size);
     size_t used = size;

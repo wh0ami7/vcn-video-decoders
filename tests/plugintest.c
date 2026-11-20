@@ -309,6 +309,11 @@ int main(void) {
   CFRelease(withCfg);
 #endif
 
+  // Every session is finalized by now: a plug-in that keeps a reference to a
+  // picture it emitted (or never releases the last one) leaves the count
+  // above 1.
+  expect("every picture the plug-in took is released",
+         CFGetRetainCount(picture) == 1);
   CFRelease(shown);
   CFRelease(hidden);
   CFRelease(broken);
