@@ -519,7 +519,11 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   // debugger.
   const char* sess = vcnvp9_gpu_armed ? "vp9" : getenv("VCNVP9_SESSION");
   const char* arm = getenv("VCNVP9_ALLOW_GPU");
-  bool traced = being_traced(),
+  // A debugger alone is not enough: it must be the dry-run script, which stops
+  // every submission before it reaches the kernel and says so with
+  // VCNVP9_DRYRUN=1. A plain debugger session would let the messages through.
+  const char* dry = getenv("VCNVP9_DRYRUN");
+  bool traced = being_traced() && dry && !strcmp(dry, "1"),
        armed =
            vcnvp9_gpu_armed || (arm && !strcmp(arm, "yes-i-know-it-can-hang"));
   if (!sess || (strcmp(sess, "vp9") && strcmp(sess, "av1")))

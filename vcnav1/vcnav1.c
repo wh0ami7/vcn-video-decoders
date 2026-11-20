@@ -641,7 +641,6 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
   return r;
 }
 
-#ifdef VCN_DRYRUN_TOOLS
 void vcnav1_flush(VcnAV1* d) {
   for (int i = 0; i < 8; i++) {
     d->parser.ref[i].valid = 0;
@@ -649,7 +648,9 @@ void vcnav1_flush(VcnAV1* d) {
   }
   memset(d->dpbRefs, 0, sizeof(d->dpbRefs));
 }
-// Used by tools/dryrun.py: copy (possibly GPU-mapped) memory to a file from
+
+#ifdef VCN_DRYRUN_TOOLS  // Used by tools/dryrun.py: copy (possibly GPU-mapped)
+                         // memory to a file from
 // inside the process.
 __attribute__((noinline, used)) int vcnav1_dump(const void* p, long n,
                                                 const char* path) {

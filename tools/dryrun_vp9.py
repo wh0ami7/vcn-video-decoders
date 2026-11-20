@@ -193,9 +193,12 @@ def dryrun_vp9(debugger, command, result, d):
         b = target.BreakpointCreateByName(name)
         b.SetScriptCallbackFunction(f"dryrun_vp9.{fn}")
     session = "vp9" if _STATE["mode"] == "session" else "av1"
+    # decode_vp9 opens the driver under a debugger only with VCNVP9_DRYRUN=1,
     env = [
-        f"{k}={v}" for k, v in os.environ.items() if k != "VCNVP9_ALLOW_GPU"
-    ] + [f"VCNVP9_SESSION={session}"]
+        f"{k}={v}"
+        for k, v in os.environ.items()
+        if k not in ("VCNVP9_ALLOW_GPU", "VCNVP9_SESSION", "VCNVP9_DRYRUN")
+    ] + [f"VCNVP9_SESSION={session}", "VCNVP9_DRYRUN=1"]
     li = lldb.SBLaunchInfo(prog_args)
     li.SetEnvironmentEntries(env, False)
     err = lldb.SBError()
