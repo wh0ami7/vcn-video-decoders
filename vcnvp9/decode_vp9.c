@@ -59,14 +59,18 @@ static int cmp_float(const void* a, const void* b) {
   return x < y ? -1 : x > y;
 }
 
-// Next frame line of a FATE reference: "stream, dts, pts, duration, size, md5".
+// Next frame of a reference, in either format: FFmpeg's FATE framemd5 ("stream,
+// dts, pts, duration, size, md5": the md5 after the last comma) or libvpx's
+// .md5 file ("md5  name.i420": the md5 first). Use libvpx's for clips that
+// change size: FATE's vp9-05-resize hashes the frames scaled back to 352x288
+// (its command line has -s 352x288), not the decoded ones.
 static bool next_ref(Ctx* c, char out[33]) {
   char line[512];
   while (c->ref && fgets(line, sizeof(line), c->ref)) {
     if (line[0] == '#') continue;
     char* h = strrchr(line, ',');
-    if (!h) continue;
-    return sscanf(h + 1, " %32s", out) == 1;
+    if (h) return sscanf(h + 1, " %32s", out) == 1;
+    if (sscanf(line, "%32[0-9a-f]", out) == 1 && strlen(out) == 32) return true;
   }
   return false;
 }
