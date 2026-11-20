@@ -99,8 +99,9 @@ void vcn_session_close(VcnDriverSession* s);
 void vcn_teardown(bool stuck, os_log_t log, const char* what,
                   void (^close)(void));
 
-// Waits until every teardown handed to the background queue has finished. For
-// tests and command line tools.
-void vcn_teardown_drain(void);
+// Waits until every teardown handed to the background queue has finished, at
+// most timeoutMs. False when one is still running: its kernel call may never
+// return. For tests and command line tools.
+bool vcn_teardown_drain(unsigned timeoutMs);
 
 #endif  // VCNCOMMON_VCNDRIVER_H_

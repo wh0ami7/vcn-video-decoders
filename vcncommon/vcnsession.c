@@ -2,6 +2,7 @@
 // function pointers: the wait for a command, opening and closing the
 // accelerator, driver and bitstream pool. See vcndriver.h.
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +133,10 @@ void vcn_session_close(VcnDriverSession* s) {
   *s = (VcnDriverSession){.log = log};
 }
 
+// Every close handed to the background queue, so that a tool can wait for
+// them with a limit.
+static dispatch_group_t teardown_group;
+
 static dispatch_queue_t teardown_queue(void) {
   static dispatch_queue_t q;
   static dispatch_once_t once;
@@ -139,6 +144,13 @@ static dispatch_queue_t teardown_queue(void) {
     q = dispatch_queue_create("com.droga.vcn.teardown",
                               dispatch_queue_attr_make_with_qos_class(
                                   DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
+    teardown_group = dispatch_group_create();
+    // A close may still run after the host is done with the plug-in. If the
+    // host unloaded the bundle by then, the queue would run code that is gone:
+    // this image stays loaded for the life of the process.
+    Dl_info info;
+    if (dladdr((const void*)vcn_teardown, &info) && info.dli_fname)
+      dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
   });
   return q;
 }
@@ -155,8 +167,9 @@ void vcn_teardown(bool stuck, os_log_t log, const char* what,
                "%{public}s: a command never finished; closing the session on "
                "a background thread, the driver may wait for the GPU",
                name ? name : "session");
-  // dispatch_async copies this block, and with it close.
-  dispatch_async(teardown_queue(), ^{
+  dispatch_queue_t q = teardown_queue();  // also makes the group
+  // dispatch_group_async copies this block, and with it close.
+  dispatch_group_async(teardown_group, q, ^{
     double t0 = wait_now_ms();
     close();
     os_log_error(log, "%{public}s: stuck session closed after %.0f ms",
@@ -165,7 +178,9 @@ void vcn_teardown(bool stuck, os_log_t log, const char* what,
   });
 }
 
-void vcn_teardown_drain(void) {
-  dispatch_sync(teardown_queue(), ^{
-                });
+bool vcn_teardown_drain(unsigned timeoutMs) {
+  teardown_queue();
+  return !dispatch_group_wait(
+      teardown_group,
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC));
 }

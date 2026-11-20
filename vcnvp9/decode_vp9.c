@@ -360,8 +360,13 @@ done:
   free(times);
   vcnvp9_destroy(d);
   // A stuck session is closed on a background queue: wait for it, so its
-  // log lines are there before the program ends.
-  vcn_teardown_drain();
+  // log lines are there before the program ends, but not for ever.
+  if (!vcn_teardown_drain(30000)) {
+    fprintf(stderr,
+            "the stuck session was still closing after 30 s: the driver is "
+            "waiting for the GPU; exiting without it\n");
+    exit_code = 1;
+  }
   if (c.ref) fclose(c.ref);
   container_close(&f);
   return exit_code;

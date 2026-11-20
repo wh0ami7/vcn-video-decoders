@@ -88,7 +88,6 @@ extern OSStatus VTDecoderSessionEmitDecodedFrame(VTVideoDecoderSession,
 // ----------------------------------------------------------------------
 typedef struct {
   VTVideoDecoderSession session;
-  CMVideoFormatDescriptionRef format;
   VcnAV1* vcn;
   int32_t width, height;
   bool tenBit;
@@ -96,6 +95,11 @@ typedef struct {
   CVPixelBufferRef
       lastFrame;  // retained output of the temporal unit being decoded
   pthread_mutex_t lock;
+  // What canAcceptFormatDescription reads, under meta. A decode holds lock
+  // for as long as the GPU takes; meta is never held across a driver call.
+  pthread_mutex_t meta;
+  CMVideoFormatDescriptionRef format;  // of the running session; NULL: none
+  bool broken;  // the session failed as a device: it decodes nothing more
   dispatch_queue_t
       queue;  // serial: frames are decoded (and emitted) in submission order
   dispatch_semaphore_t slots;  // bounds frames queued but not yet decoded
@@ -123,20 +127,33 @@ static os_log_t logger(void) {
 
 // Driver sessions of this plug-in in this process, for the log: a host that
 // keeps creating sessions without ending them shows up as a growing "live".
-static long g_started, g_ended;
+static long g_started, g_ended, g_live;
+
+// Sets the format canAcceptFormatDescription compares with (NULL: none), for
+// a session that starts or ends. Either way the session is not broken.
+static void set_format(Storage* s, CMVideoFormatDescriptionRef fmt) {
+  pthread_mutex_lock(&s->meta);
+  CMVideoFormatDescriptionRef old = s->format;
+  s->format = fmt ? (CMVideoFormatDescriptionRef)CFRetain(fmt) : NULL;
+  s->broken = false;
+  pthread_mutex_unlock(&s->meta);
+  if (old) CFRelease(old);
+}
 
 // Ends the decoder session, if there is one, and logs it with the counts. The
 // caller holds s->lock or is the only one left using s.
 static void end_session(Storage* s, const char* why) {
+  set_format(s, NULL);
   if (!s->vcn) return;
   vcnav1_destroy(s->vcn);
   s->vcn = NULL;
   long ended = __atomic_add_fetch(&g_ended, 1, __ATOMIC_RELAXED),
+       live = __atomic_sub_fetch(&g_live, 1, __ATOMIC_RELAXED),
        started = __atomic_load_n(&g_started, __ATOMIC_RELAXED);
   os_log_info(logger(),
               "session %dx%d ended (%{public}s): %ld started, %ld ended, %ld "
               "live in this process",
-              s->width, s->height, why, started, ended, started - ended);
+              s->width, s->height, why, started, ended, live);
 }
 
 static Storage* storage_of(VTVideoDecoderRef dec) {
@@ -190,11 +207,11 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
 static void base_finalize(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
   drain(s);
-  end_session(s, "finalized");
-  if (s->format) CFRelease(s->format);
+  end_session(s, "finalized");  // releases the format too
   if (s->queue) dispatch_release(s->queue);
   if (s->slots) dispatch_release(s->slots);
   pthread_mutex_destroy(&s->lock);
+  pthread_mutex_destroy(&s->meta);
 }
 
 static CFStringRef base_copy_debug_description(CMBaseObjectRef obj) {
@@ -229,19 +246,16 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
   CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
   if (dim.width <= 0 || dim.height <= 0)
     return kVTVideoDecoderUnsupportedDataFormatErr;
-  // A second start replaces the decoder of the first one.
+  // A second start replaces the decoder of the first one. Ending it drops its
+  // format too: a start that fails must leave none that
+  // canAcceptFormatDescription could match.
   drain(s);
   pthread_mutex_lock(&s->lock);
   end_session(s, "replaced by a new start");
-  // Kept only once the new session runs: a start that fails must leave no
-  // format that canAcceptFormatDescription could match.
-  if (s->format) CFRelease(s->format);
-  s->format = NULL;
   s->session = session;
   pthread_mutex_unlock(&s->lock);
-  s->width = dim.width;
-  s->height = dim.height;
-  s->tenBit = false;
+  int32_t width = dim.width, height = dim.height;
+  bool tenBit = false;
 
   CFDataRef av1C = copy_av1C(fmt);
   const uint8_t* cfg = av1C ? CFDataGetBytePtr(av1C) : NULL;
@@ -259,61 +273,65 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
       CFRelease(av1C);
       return kVTVideoDecoderUnsupportedDataFormatErr;
     }
-    s->tenBit = high;
+    tenBit = high;
   }
-  int32_t maxW = s->width > 4096 ? s->width : 4096,
-          maxH = s->height > 2304 ? s->height : 2304;
-  if (s->width > 8192 || s->height > 4352) {
+  int32_t maxW = width > 4096 ? width : 4096,
+          maxH = height > 2304 ? height : 2304;
+  if (width > 8192 || height > 4352) {
     if (av1C) CFRelease(av1C);
     return kVTVideoDecoderUnsupportedDataFormatErr;
   }
   char err[256] = "";
-  vcnav1_gpu_armed = 1;
+  __atomic_store_n(&vcnav1_gpu_armed, 1, __ATOMIC_RELAXED);
   VcnAV1* vcn = vcnav1_create(maxW, maxH, err, sizeof(err));
   if (!vcn) {
     os_log_error(logger(), "vcnav1_create: %{public}s", err);
     if (av1C) CFRelease(av1C);
     return kVTVideoDecoderNotAvailableNowErr;
   }
-  pthread_mutex_lock(&s->lock);
-  s->vcn = vcn;
-  __atomic_add_fetch(&g_started, 1, __ATOMIC_RELAXED);
-  pthread_mutex_unlock(&s->lock);
-  int cr =
-      cfg && cfgLen > 4 ? vcnav1_configure(s->vcn, cfg + 4, cfgLen - 4) : 0;
+  // The new session is set up before anything else can see it: until it is
+  // published below, neither invalidate nor a decode can reach it.
+  int cr = cfg && cfgLen > 4 ? vcnav1_configure(vcn, cfg + 4, cfgLen - 4) : 0;
   if (cr)
     os_log_error(logger(), "configOBUs rejected: %{public}s",
-                 vcnav1_last_error(s->vcn));
+                 vcnav1_last_error(vcn));
   if (av1C) CFRelease(av1C);
   // A sequence header the engine cannot decode: VideoToolbox can pick another
   // decoder.
   if (cr == VCNAV1_UNSUPPORTED) {
-    pthread_mutex_lock(&s->lock);
-    end_session(s, "unsupported sequence header");
-    pthread_mutex_unlock(&s->lock);
+    vcnav1_destroy(vcn);
     return kVTVideoDecoderUnsupportedDataFormatErr;
   }
 
   CFDictionaryRef attrs =
-      vcnav1_copy_pixel_buffer_attributes(s->width, s->height, s->tenBit);
+      vcnav1_copy_pixel_buffer_attributes(width, height, tenBit);
   if (!attrs) {  // out of memory: no session rather than one with no attributes
-    pthread_mutex_lock(&s->lock);
-    end_session(s, "out of memory");
-    pthread_mutex_unlock(&s->lock);
+    vcnav1_destroy(vcn);
     return kVTAllocationFailedErr;
   }
   VTDecoderSessionSetPixelBufferAttributes(session, attrs);
   CFRelease(attrs);
   pthread_mutex_lock(&s->lock);
-  s->format = (CMVideoFormatDescriptionRef)CFRetain(fmt);
-  pthread_mutex_unlock(&s->lock);
-  long started = __atomic_load_n(&g_started, __ATOMIC_RELAXED),
+  if (__atomic_load_n(&s->invalidated, __ATOMIC_RELAXED)) {
+    // Invalidated while the session was being made: nothing may stay open.
+    pthread_mutex_unlock(&s->lock);
+    vcnav1_destroy(vcn);
+    return kVTInvalidSessionErr;
+  }
+  end_session(s, "replaced by a new start");  // a start that ran alongside
+  s->vcn = vcn;
+  s->width = width;
+  s->height = height;
+  s->tenBit = tenBit;
+  long started = __atomic_add_fetch(&g_started, 1, __ATOMIC_RELAXED),
+       live = __atomic_add_fetch(&g_live, 1, __ATOMIC_RELAXED),
        ended = __atomic_load_n(&g_ended, __ATOMIC_RELAXED);
+  set_format(s, fmt);
+  pthread_mutex_unlock(&s->lock);
   os_log(logger(),
          "session %dx%d %{public}s: %ld started, %ld ended, %ld live in this "
          "process",
-         s->width, s->height, s->tenBit ? "10-bit" : "8-bit", started, ended,
-         started - ended);
+         width, height, tenBit ? "10-bit" : "8-bit", started, ended, live);
   return noErr;
 }
 
@@ -402,7 +420,15 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
   if (!status &&
       vcnav1_decode(s->vcn, (const uint8_t*)ptr, len, 0, on_output, s)) {
     os_log_error(logger(), "decode: %{public}s", vcnav1_last_error(s->vcn));
-    status = decode_status(vcnav1_failure(s->vcn));
+    int failure = vcnav1_failure(s->vcn);
+    status = decode_status(failure);
+    // The session takes no more frames: canAcceptFormatDescription says no
+    // from now on, so VideoToolbox makes a new decoder.
+    if (failure == VCNAV1_FAIL_DEVICE) {
+      pthread_mutex_lock(&s->meta);
+      s->broken = true;
+      pthread_mutex_unlock(&s->meta);
+    }
   }
   CVPixelBufferRef out = s->lastFrame;
   s->lastFrame = NULL;
@@ -484,12 +510,16 @@ static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
                                      CMFormatDescriptionRef fmt) {
   Storage* s = storage_of(dec);
   if (!fmt) return false;
-  // A decoder whose start failed, whose session broke down to nothing or that
-  // was invalidated takes no format: VideoToolbox must make a new one.
-  pthread_mutex_lock(&s->lock);
+  // A decoder whose start failed, whose session broke or that was invalidated
+  // takes no format: VideoToolbox must make a new one. Read under meta, not
+  // lock: a decode holds lock while the GPU works on its frame.
+  pthread_mutex_lock(&s->meta);
   CMFormatDescriptionRef cur =
-      s->vcn && !s->invalidated && s->format ? CFRetain(s->format) : NULL;
-  pthread_mutex_unlock(&s->lock);
+      s->format && !s->broken &&
+              !__atomic_load_n(&s->invalidated, __ATOMIC_RELAXED)
+          ? CFRetain(s->format)
+          : NULL;
+  pthread_mutex_unlock(&s->meta);
   if (!cur) return false;
   Boolean same = false;
   CMVideoDimensions a = CMVideoFormatDescriptionGetDimensions(cur),
@@ -545,6 +575,7 @@ __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
   memset(s, 0, sizeof(*s));
   pthread_mutex_init(&s->lock, NULL);
+  pthread_mutex_init(&s->meta, NULL);
   s->queue = dispatch_queue_create(
       "com.droga.vtav1vcn.decode",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,

@@ -547,15 +547,15 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   // which stops the submission, or with the explicit switch. VCNVP9_SESSION=av1
   // pairs an AV1 session with VP9 messages, so it must never run without the
   // debugger.
-  const char* sess = vcnvp9_gpu_armed ? "vp9" : getenv("VCNVP9_SESSION");
+  bool pluginArmed = __atomic_load_n(&vcnvp9_gpu_armed, __ATOMIC_RELAXED);
+  const char* sess = pluginArmed ? "vp9" : getenv("VCNVP9_SESSION");
   const char* arm = getenv("VCNVP9_ALLOW_GPU");
   // A debugger alone is not enough: it must be the dry-run script, which stops
   // every submission before it reaches the kernel and says so with
   // VCNVP9_DRYRUN=1. A plain debugger session would let the messages through.
   const char* dry = getenv("VCNVP9_DRYRUN");
   bool traced = being_traced() && dry && !strcmp(dry, "1"),
-       armed =
-           vcnvp9_gpu_armed || (arm && !strcmp(arm, "yes-i-know-it-can-hang"));
+       armed = pluginArmed || (arm && !strcmp(arm, "yes-i-know-it-can-hang"));
   if (!sess || (strcmp(sess, "vp9") && strcmp(sess, "av1")))
     FAIL("set VCNVP9_SESSION=vp9 or av1");
   if (!traced && !armed)
@@ -708,7 +708,9 @@ static int submit(VcnVP9* d, VP9Params* prm) {
     return -1;
   }
   if (w != VCN_WAIT_DONE) {
-    d->broken = true;
+    // The command went out and may still be on the GPU: closing the session
+    // can wait for it, as after a timeout.
+    d->stuck = d->broken = true;
     snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
     return -1;
   }

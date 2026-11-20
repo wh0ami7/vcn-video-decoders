@@ -9,9 +9,10 @@
 // Each session is a VTDecompressionSession that requires hardware: it decodes
 // the first k frames of the clip (default 3), waits for them, then is
 // invalidated and released. -load registers the bundle in this process only;
-// nothing is installed. At the end it lists the decoder plug-in images loaded
-// in the process, so a run where VideoToolbox picked the installed plug-in
-// instead of the -load'ed one can be seen.
+// nothing is installed. The bundle is registered under its own ID
+// (com.droga.vtchurn.av1 or .vp9), and without -id every session asks for that
+// decoder, so VideoToolbox cannot pick an installed plug-in instead. At the end
+// it lists the decoder plug-in images loaded in the process.
 //
 // A session that leaks something the system counts shows as a growth per
 // session after the first one. Lines:
@@ -37,8 +38,37 @@ static void copy_kv(const void* k, const void* v, void* dict) {
   CFDictionarySetValue(dict, k, v);
 }
 
-// As vtav1test's: registers the bundle's decoders in this process only.
-static int load_bundle(const char* path, CMVideoCodecType codec) {
+// The DecoderID VideoToolbox lists for a decoder registered with implID, or
+// NULL. It makes it from the CMClassImplementationID and the codec ("<id>.av01"
+// on Tahoe 26.7.3); a DecoderID in the registration is not used.
+static CFStringRef copy_decoder_id(CFStringRef implID, CMVideoCodecType codec) {
+  OSStatus (*copyList)(CFDictionaryRef, CFArrayRef*) =
+      dlsym(RTLD_DEFAULT, "VTCopyVideoDecoderList");
+  CFArrayRef decs = NULL;
+  if (!copyList || copyList(NULL, &decs) || !decs) return NULL;
+  CFStringRef prefix =
+      CFStringCreateWithFormat(NULL, NULL, CFSTR("%@."), implID);
+  CFStringRef found = NULL;
+  for (CFIndex i = 0; prefix && !found && i < CFArrayGetCount(decs); i++) {
+    CFDictionaryRef d = CFArrayGetValueAtIndex(decs, i);
+    CFStringRef id = CFDictionaryGetValue(d, CFSTR("DecoderID"));
+    CFNumberRef type = CFDictionaryGetValue(d, CFSTR("CodecType"));
+    SInt64 t = 0;
+    if (id && CFGetTypeID(id) == CFStringGetTypeID() && type &&
+        CFGetTypeID(type) == CFNumberGetTypeID() &&
+        CFNumberGetValue(type, kCFNumberSInt64Type, &t) && t == codec &&
+        (CFEqual(id, implID) || CFStringHasPrefix(id, prefix)))
+      found = CFRetain(id);
+  }
+  if (prefix) CFRelease(prefix);
+  CFRelease(decs);
+  return found;
+}
+
+// As vtav1test's: registers the bundle's decoders in this process only, but
+// under implID, which no installed plug-in has.
+static int load_bundle(const char* path, CMVideoCodecType codec,
+                       CFStringRef implID) {
   CFURLRef url = CFURLCreateFromFileSystemRepresentation(
       NULL, (const UInt8*)path, (CFIndex)strlen(path), true);
   CFBundleRef b = url ? CFBundleCreate(NULL, url) : NULL;
@@ -64,6 +94,7 @@ static int load_bundle(const char* path, CMVideoCodecType codec) {
     CFStringRef name =
         CFDictionaryGetValue(impl, CFSTR("CMClassImplementationName"));
     if (name) CFDictionarySetValue(info, CFSTR("CodecName"), name);
+    CFDictionarySetValue(info, CFSTR("CMClassImplementationID"), implID);
     OSStatus st = reg(codec, info, factory);
     CFRelease(info);
     printf("registered %p from %s -> %d\n", factory, path, (int)st);
@@ -193,8 +224,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // For the plug-in's log lines of this process (log show, processID).
+  printf("pid %d\n", (int)getpid());
   measure("start, nothing loaded", 0, &ports0, &uc0);
-  if (load_bundle(bundle, codec)) return 1;
+  CFStringRef implID = codec == kCMVideoCodecType_AV1
+                           ? CFSTR("com.droga.vtchurn.av1")
+                           : CFSTR("com.droga.vtchurn.vp9");
+  if (load_bundle(bundle, codec, implID)) return 1;
   CMVideoFormatDescriptionRef fmt = NULL;
   if (CMVideoFormatDescriptionCreate(NULL, codec, w, h, NULL, &fmt)) return 1;
   CFMutableDictionaryRef spec =
@@ -203,15 +239,24 @@ int main(int argc, char** argv) {
   CFDictionarySetValue(
       spec, kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
       kCFBooleanTrue);
-  if (decoderID) {
-    CFStringRef id =
-        CFStringCreateWithCString(NULL, decoderID, kCFStringEncodingUTF8);
-    if (!id) return usage();
-    CFDictionarySetValue(spec, CFSTR("DecoderID"), id);
-    CFRelease(id);
+  CFStringRef id = decoderID ? CFStringCreateWithCString(NULL, decoderID,
+                                                         kCFStringEncodingUTF8)
+                             : copy_decoder_id(implID, codec);
+  if (!id) {
+    if (decoderID) return usage();
+    fprintf(stderr,
+            "VideoToolbox does not list the decoder just registered: "
+            "nothing tells its sessions from those of another plug-in\n");
+    return 1;
   }
+  CFDictionarySetValue(spec, CFSTR("DecoderID"), id);
+  char idText[256] = "";
+  CFStringGetCString(id, idText, sizeof(idText), kCFStringEncodingUTF8);
+  printf("sessions ask for decoder %s\n", idText);
+  CFRelease(id);
 
-  int failedStarts = 0, frameErrors = 0, frames = 0;
+  // ports1 and uc1 are taken after the first session that started.
+  int failedStarts = 0, frameErrors = 0, frames = 0, started = 0;
   for (long n = 1; n <= sessions; n++) {
     Ctx c = {0};
     VTDecompressionOutputCallbackRecord cb = {out_cb, &c};
@@ -223,6 +268,7 @@ int main(int argc, char** argv) {
       printf("session %ld: VTDecompressionSessionCreate %d\n", n, (int)st);
       continue;
     }
+    started++;
     for (long i = 0; i < k; i++) {
       CMBlockBufferRef bb = NULL;
       CMSampleBufferRef sb = NULL;
@@ -247,7 +293,8 @@ int main(int argc, char** argv) {
     CFRelease(sess);
     frames += c.frames;
     frameErrors += c.errors;
-    if (n == 1) measure("after session 1", 1, &ports1, &uc1);
+    if (started == 1)
+      measure("after the first session that started", 1, &ports1, &uc1);
     if (n % 50 == 0 && n != sessions) measure("running", (int)n, NULL, NULL);
   }
   // A stuck session would be closed on the decoder's background queue: give
@@ -256,12 +303,22 @@ int main(int argc, char** argv) {
   unsigned portsN;
   int ucN;
   measure("end", (int)sessions, &portsN, &ucN);
-  double per = (double)(sessions - 1);
-  printf("growth per session after the first: ports %.2f user clients %.2f\n",
-         ((double)portsN - ports1) / per,
-         uc1 >= 0 && ucN >= 0 ? (ucN - uc1) / per : -1.0);
-  printf("sessions %ld, failed starts %d, frames %d, frame errors %d\n",
-         sessions, failedStarts, frames, frameErrors);
+  // Per session that started, after the first one; none to divide by below 2.
+  if (started < 2) {
+    printf("growth per session after the first: n/a (%d sessions started)\n",
+           started);
+  } else {
+    double per = (double)(started - 1);
+    char uc[32] = "n/a (ioreg failed)";
+    if (uc1 >= 0 && ucN >= 0)
+      snprintf(uc, sizeof(uc), "%.2f", (ucN - uc1) / per);
+    printf("growth per session after the first: ports %.2f user clients %s\n",
+           ((double)portsN - ports1) / per, uc);
+  }
+  printf(
+      "sessions %ld, started %d, failed starts %d, frames %d, frame errors "
+      "%d\n",
+      sessions, started, failedStarts, frames, frameErrors);
   printf("decoder plug-in images in this process:\n");
   for (uint32_t i = 0; i < _dyld_image_count(); i++) {
     const char* name = _dyld_get_image_name(i);

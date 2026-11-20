@@ -15,10 +15,15 @@
 //   8. (AV1) a sequence header in av1C that the engine cannot decode refuses
 //      the session;
 //   9. a sample the decoder session fails as a device failure (a stuck GPU,
-//      a driver call that failed) is a malfunction, not bad data;
-//  10. after a start that fails, no format is accepted.
+//      a driver call that failed) is a malfunction, not bad data, and the
+//      format is not accepted after it; one that runs out of memory is
+//      kVTAllocationFailedErr;
+//  10. after a start that fails, no format is accepted;
+//  11. canAcceptFormatDescription does not wait for a decode in progress;
+//  12. a start that invalidate overtakes closes its new session again.
 //
 // usage: plugintest   (exit status 0 = pass)
+#include <dispatch/dispatch.h>
 #include <signal.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -92,13 +97,26 @@ OSStatus VTDecoderSessionEmitDecodedFrame(VTVideoDecoderSession session,
 // ---- stand-in decoder session
 // ------------------------------------------------- A sample's first byte says
 // what it does: 0 shows nothing, 1 shows a frame, 2 shows a frame and then
-// fails as a bad stream, 3 fails as a broken device.
+// fails as a bad stream, 3 fails as a broken device, 4 runs out of memory, 5
+// shows a frame after waiting (at most 3 s) for the test to let it go.
 struct Fake {
   int unused;
 };
 static int creates, destroys;
 static bool failCreate;  // the next session start fails
 static int lastFailure;
+// Invalidated by the next session start while it makes its session.
+static VTVideoDecoderRef invalidateInCreate;
+// Sample 5: says it is decoding, then waits to be let go.
+static dispatch_semaphore_t slowEntered, slowRelease;
+static bool slowTimedOut;
+static void slow_decode(void) {
+  dispatch_semaphore_signal(slowEntered);
+  if (dispatch_semaphore_wait(
+          slowRelease, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC)))
+    slowTimedOut = true;
+}
+static int fake_failure(uint8_t what);
 #if defined(TEST_AV1)
 static int configureResult;
 #endif
@@ -106,6 +124,7 @@ static CVPixelBufferRef picture;
 
 static Vcn* fake_create(void) {
   if (failCreate) return NULL;
+  if (invalidateInCreate) base_invalidate((CMBaseObjectRef)invalidateInCreate);
   creates++;
   return (Vcn*)calloc(1, sizeof(struct Fake));
 }
@@ -141,9 +160,10 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t tag,
                   VcnAV1OutputFn fn, void* ctx) {
   (void)d, (void)size;
-  if (tu[0] == 1 || tu[0] == 2) fn(ctx, picture, NULL, tag);
-  lastFailure = tu[0] == 3 ? VCNAV1_FAIL_DEVICE : VCNAV1_FAIL_STREAM;
-  return tu[0] >= 2 ? -1 : 0;
+  if (tu[0] == 5) slow_decode();
+  if (tu[0] == 1 || tu[0] == 2 || tu[0] == 5) fn(ctx, picture, NULL, tag);
+  lastFailure = fake_failure(tu[0]);
+  return tu[0] >= 2 && tu[0] <= 4 ? -1 : 0;
 }
 int vcnav1_failure(VcnAV1* d) {
   (void)d;
@@ -172,9 +192,11 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
                   VcnVP9OutputFn fn, void* ctx) {
   (void)d, (void)size;
-  if (chunk[0] == 1 || chunk[0] == 2) fn(ctx, picture, NULL, 16, 16, tag);
-  lastFailure = chunk[0] == 3 ? VCNVP9_FAIL_DEVICE : VCNVP9_FAIL_STREAM;
-  return chunk[0] >= 2 ? -1 : 0;
+  if (chunk[0] == 5) slow_decode();
+  if (chunk[0] == 1 || chunk[0] == 2 || chunk[0] == 5)
+    fn(ctx, picture, NULL, 16, 16, tag);
+  lastFailure = fake_failure(chunk[0]);
+  return chunk[0] >= 2 && chunk[0] <= 4 ? -1 : 0;
 }
 int vcnvp9_failure(VcnVP9* d) {
   (void)d;
@@ -182,11 +204,25 @@ int vcnvp9_failure(VcnVP9* d) {
 }
 #endif
 
+#if defined(TEST_AV1)
+static int fake_failure(uint8_t what) {
+  return what == 3   ? VCNAV1_FAIL_DEVICE
+         : what == 4 ? VCNAV1_FAIL_MEMORY
+                     : VCNAV1_FAIL_STREAM;
+}
+#else
+static int fake_failure(uint8_t what) {
+  return what == 3   ? VCNVP9_FAIL_DEVICE
+         : what == 4 ? VCNVP9_FAIL_MEMORY
+                     : VCNVP9_FAIL_STREAM;
+}
+#endif
+
 // ---- helpers
 // ------------------------------------------------------------------
 static CMSampleBufferRef sample(uint8_t what) {
-  static uint8_t bytes[4][4] = {
-      {0, 1, 2, 3}, {1, 1, 2, 3}, {2, 1, 2, 3}, {3, 1, 2, 3}};
+  static uint8_t bytes[6][4] = {{0, 1, 2, 3}, {1, 1, 2, 3}, {2, 1, 2, 3},
+                                {3, 1, 2, 3}, {4, 1, 2, 3}, {5, 1, 2, 3}};
   CMBlockBufferRef bb = NULL;
   if (CMBlockBufferCreateWithMemoryBlock(NULL, bytes[what], 4, kCFAllocatorNull,
                                          NULL, 0, 4, 0, &bb))
@@ -286,6 +322,31 @@ int main(void) {
          emits == e + 4 && lastStatus == kVTVideoDecoderMalfunctionErr &&
              emitImages == 1);
   CFRelease(stuck);
+  expect("after a device failure the format is not accepted",
+         !dec_can_accept_format(dec, fmt));
+  CMSampleBufferRef nomem = sample(4);
+  dec_decode_frame(dec, NULL, nomem, 0, NULL);
+  expect("a sample that runs out of memory is kVTAllocationFailedErr",
+         emits == e + 5 && lastStatus == kVTAllocationFailedErr);
+  CFRelease(nomem);
+  expect("a new start takes the format again",
+         !dec_start_session(dec, NULL, fmt) && dec_can_accept_format(dec, fmt));
+
+  // A decode holds the session while the GPU works on its frame.
+  CMSampleBufferRef slow = sample(5);
+  slowEntered = dispatch_semaphore_create(0);
+  slowRelease = dispatch_semaphore_create(0);
+  dec_decode_frame(dec, NULL, slow,
+                   kVTDecodeFrame_EnableAsynchronousDecompression, NULL);
+  bool entered = !dispatch_semaphore_wait(
+      slowEntered, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  Boolean accepted = dec_can_accept_format(dec, fmt);
+  bool blocked = slowTimedOut;
+  dispatch_semaphore_signal(slowRelease);
+  dec_finish_delayed_frames(dec);
+  expect("canAcceptFormatDescription does not wait for a running decode",
+         entered && accepted && !blocked);
+  CFRelease(slow);
 
   e = emits;
   inCallback = reenter;
@@ -341,6 +402,19 @@ int main(void) {
   expect("and a frame is refused as an invalid session",
          !r3 && emits == e + 1 && lastStatus == kVTInvalidSessionErr);
   base_invalidate((CMBaseObjectRef)dec);
+  base_finalize((CMBaseObjectRef)dec);
+  free(dec);
+
+  expect("a decoder for the start and invalidate test",
+         !CREATE(CODEC, NULL, &dec) && dec);
+  int c0 = creates;
+  d0 = destroys;
+  invalidateInCreate = dec;
+  OSStatus ri = dec_start_session(dec, NULL, fmt);
+  invalidateInCreate = NULL;
+  expect("a start that invalidate overtakes closes its new session",
+         ri == kVTInvalidSessionErr && creates == c0 + 1 &&
+             destroys == d0 + 1 && !dec_can_accept_format(dec, fmt));
   base_finalize((CMBaseObjectRef)dec);
   free(dec);
 

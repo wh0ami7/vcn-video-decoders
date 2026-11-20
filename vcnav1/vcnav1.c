@@ -473,10 +473,13 @@ static double tnow_ms(void) {
   return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
 }
 static int timing = -1;
-static double t_sched, t_wait;
-static int submit(VcnAV1* d, AV1Params* prm) {
+// Sends one frame and waits for it. *sched and *wait get the time spent in
+// ScheduleAVDCommands and in the wait, for VCNAV1_TIMING.
+static int submit(VcnAV1* d, AV1Params* prm, double* sched, double* wait) {
+  *sched = *wait = 0;
   const char* arm = getenv("VCNAV1_ALLOW_GPU");
-  if (!vcnav1_gpu_armed && (!arm || strcmp(arm, "yes-i-know-it-can-hang"))) {
+  if (!__atomic_load_n(&vcnav1_gpu_armed, __ATOMIC_RELAXED) &&
+      (!arm || strcmp(arm, "yes-i-know-it-can-hang"))) {
     snprintf(d->err, sizeof(d->err),
              "GPU submission disabled (set VCNAV1_ALLOW_GPU)");
     d->failure = VCNAV1_FAIL_DEVICE;
@@ -509,8 +512,8 @@ static int submit(VcnAV1* d, AV1Params* prm) {
   VcnWaitResult w =
       vcn_wait_command(FN(QueryAVDCommandStatus), d->s.drv, refcons[0],
                        VCN_COMMAND_TIMEOUT_MS, &fw, &ds);
-  t_sched = t1 - t0;
-  t_wait = tnow_ms() - t1;
+  *sched = t1 - t0;
+  *wait = tnow_ms() - t1;
   DBG("wait=%d firmware=%u driver=%d\n", (int)w, fw, ds);
   if (w == VCN_WAIT_TIMEOUT) {
     // The GPU still holds this command. Sending more work, or reading the
@@ -522,7 +525,9 @@ static int submit(VcnAV1* d, AV1Params* prm) {
     return -1;
   }
   if (w != VCN_WAIT_DONE) {
-    d->broken = true;
+    // The command went out and may still be on the GPU: closing the session
+    // can wait for it, as after a timeout.
+    d->stuck = d->broken = true;
     snprintf(d->err, sizeof(d->err), "QueryAVDCommandStatus %d", ds);
     return -1;
   }
@@ -659,10 +664,11 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
       h->frame_type, h->show_frame, w, hh, h->base_q_idx, h->TileCols,
       h->TileRows, p->tile_data_size, slot, h->refresh_frame_flags);
   double tf1 = timing ? tnow_ms() : 0;
-  if (submit(d, &prm)) return -1;
+  double tSched, tWait;
+  if (submit(d, &prm, &tSched, &tWait)) return -1;
   if (timing)
     fprintf(stderr, "timing bytes=%zu prep=%.2f sched=%.2f wait=%.2f\n",
-            p->tile_data_size, tf1 - tf0, t_sched, t_wait);
+            p->tile_data_size, tf1 - tf0, tSched, tWait);
   av1_reference_update(p, slot);
   release_slot_refs(d);
   if (h->show_frame && d->out) {

@@ -15,13 +15,19 @@
 //   4. a driver without AVD_DestroyAVDAccelerator still opens and closes;
 //   5. a command that never finishes stops the session as a device failure
 //      (later frames too, without another command), and its teardown runs on
-//      the background queue and still releases everything;
+//      the background queue, not on the caller's thread, and still releases
+//      everything; the same after a failed QueryAVDCommandStatus, since the
+//      command may still be on the GPU;
 //   6. a ScheduleAVDCommands failure is a device failure; a firmware result
-//      is counted, the frame is not refused.
+//      is counted, the frame is not refused;
+//   7. a pool with a missing buffer fails the create and is freed; a failed
+//      CreateAVDAccelerator that leaves its result set destroys nothing.
 //
 // usage: sessiontest <first frames of a small IVF clip of the codec>
 // Exit status 0 = pass.
 #include <IOKit/IOKitLib.h>
+#include <dispatch/dispatch.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,10 +86,15 @@ static struct {
   int liveAccels, liveDrivers;
   bool freeWithoutPool;  // FreeBitstreamBufferPool on a pool never allocated
   bool useAfterDestroy;  // a driver call after the accelerator was destroyed
+  bool deleteCtxOnMain;  // DeleteContexts ran on the test's own thread
+  bool gateTimedOut;     // DeleteContexts waited at the gate in vain
 } st;
 // What it should get wrong.
 static struct {
   int create, createDriver, alloc, createCtx, schedule;
+  int queryFail;      // QueryAVDCommandStatus returns this
+  bool leaveOut;      // a failed CreateAVDAccelerator leaves *out set
+  bool nullBuf;       // the pool comes back without its second buffer
   bool hang;          // commands never finish
   unsigned firmware;  // result of every finished command
   bool noDestroy;     // the build has no AVD_DestroyAVDAccelerator
@@ -142,6 +153,10 @@ static int f_alloc(void* h, AVD_BitstreamPool* p) {
   if (p->count != VCN_NUM_BS) return 5;
   for (int i = 0; i < VCN_NUM_BS; i++)
     p->addressesOut[i] = d->buffers[i] = calloc(1, kFakeBuffer);
+  if (fault.nullBuf) {
+    free(d->buffers[1]);
+    p->addressesOut[1] = d->buffers[1] = NULL;
+  }
   d->poolAllocated = true;
   return 0;
 }
@@ -161,10 +176,21 @@ static int f_create_ctx(void* h, AVD_DriverContextInit* ci) {
   ci->list->contextsOut[0] = &d->ctx;
   return 0;
 }
+// While set, DeleteContexts waits until the test has its thread back from
+// DESTROY: a close that runs on that thread, or that DESTROY waits for, cannot
+// get through and is seen.
+static dispatch_semaphore_t closeGate;
+static pthread_t mainThread;
 static int f_delete_ctx(void* h, AVD_DriverContextDelete* del) {
   (void)h;
   st.deleteCtx++;
   st.seqDeleteCtx = ++st.seq;
+  if (closeGate) {
+    if (pthread_equal(pthread_self(), mainThread)) st.deleteCtxOnMain = true;
+    if (dispatch_semaphore_wait(
+            closeGate, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)))
+      st.gateTimedOut = true;
+  }
   return del->count == 1 && del->contexts[0] ? 0 : 5;
 }
 static int f_schedule(void* h, AVD_CmdList* l, AVD_RefConList* r) {
@@ -177,6 +203,7 @@ static int f_query(void* h, AVD_QueryList* q) {
   (void)h;
   st.queries++;
   AVD_QueryEntry* e = q->entries;
+  if (fault.queryFail) return fault.queryFail;
   if (fault.hang) {
     if (e->wait) return 99;  // the real one would block here
     e->status = 2;
@@ -192,7 +219,12 @@ static int f_create_accel(AVD_Accelerator** out, AVD_AcceleratorCreate* in,
   (void)in, (void)info;
   st.creates++;
   *out = NULL;
-  if (fault.create) return fault.create;
+  if (fault.create) {
+    // Never made: a destroy or a driver call through it is seen.
+    static FakeAccel stray;
+    if (fault.leaveOut) *out = &stray.a;
+    return fault.create;
+  }
   FakeAccel* a = calloc(1, sizeof(*a));
   a->a.fn[AVD_FN_CreateDriver] = (void*)f_create_driver;
   a->a.fn[AVD_FN_DeleteDriver] = (void*)f_delete_driver;
@@ -272,6 +304,20 @@ static Vcn* make(void) {
   return d;
 }
 
+// Destroys a stuck session and checks that its close ran on the background
+// queue: not on this thread, and not waited for by DESTROY.
+static bool closed_in_background(Vcn* d) {
+  closeGate = dispatch_semaphore_create(0);
+  DESTROY(d);
+  dispatch_semaphore_signal(closeGate);
+  bool drained = vcn_teardown_drain(10000);
+  // A close still running may yet wait on the gate: keep it then.
+  if (drained) dispatch_release(closeGate);
+  closeGate = NULL;
+  return drained && st.deleteCtx == 1 && !st.deleteCtxOnMain &&
+         !st.gateTimedOut;
+}
+
 static void hung(int sig) {
   (void)sig;
   static const char msg[] = "FAIL a test hung\n";
@@ -286,6 +332,7 @@ int main(int argc, char** argv) {
   }
   signal(SIGALRM, hung);
   alarm(60);
+  mainThread = pthread_self();
   ARMED = 1;
 
   reset();
@@ -306,6 +353,12 @@ int main(int argc, char** argv) {
       !make() && st.creates == 1 && st.destroys == 0 && st.createDrivers == 0);
 
   reset();
+  fault.create = 1;
+  fault.leaveOut = true;
+  expect("one that leaves its result set destroys nothing either",
+         !make() && st.destroys == 0 && st.createDrivers == 0);
+
+  reset();
   fault.createDriver = 5;
   expect("a failed CreateDriver still destroys the accelerator, once",
          !make() && st.destroys == 1 && st.frees == 0 &&
@@ -316,6 +369,12 @@ int main(int argc, char** argv) {
   expect("a failed pool allocation: the pool is not freed, the rest is",
          !make() && st.frees == 0 && st.deleteDrivers == 1 &&
              st.destroys == 1 && all_released());
+
+  reset();
+  fault.nullBuf = true;
+  expect("a pool with a missing buffer fails the create and is freed",
+         !make() && st.createCtx == 0 && st.frees == 1 &&
+             st.deleteDrivers == 1 && st.destroys == 1 && all_released());
 
   reset();
   fault.createCtx = 10;
@@ -358,10 +417,21 @@ int main(int argc, char** argv) {
          rh != 0 && kh == FAIL_DEVICE);
   expect("later frames fail the same way and send nothing",
          rh2 != 0 && kh2 == FAIL_DEVICE && st.schedules == schedules);
-  if (d) DESTROY(d);
-  vcn_teardown_drain();
+  bool background = d && closed_in_background(d);
   expect("the stuck session is closed on the background queue, fully",
-         st.destroys == 1 && st.deleteCtx == 1 && all_released());
+         background && st.destroys == 1 && all_released());
+
+  reset();
+  d = make();
+  fault.queryFail = 4;
+  int rq = d ? DECODE(d, frame0, frame0Size, 0, on_out, NULL) : 0;
+  int kq = d ? FAILURE(d) : -1;
+  fault.queryFail = 0;
+  expect("a failed QueryAVDCommandStatus is a device failure",
+         rq != 0 && kq == FAIL_DEVICE);
+  background = d && closed_in_background(d);
+  expect("and, the command maybe still on the GPU, closes in the background",
+         background && st.destroys == 1 && all_released());
 
   reset();
   d = make();
