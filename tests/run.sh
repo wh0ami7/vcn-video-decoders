@@ -45,7 +45,11 @@ damaged() {
     > "${B}/damaged.txt"
 }
 check "${rounds} damaged copies of each stream are survived" damaged
-
+av1state() {
+  "${B}/av1state" media/av1/av1-1-b8-01-size-16x16.ivf > "${B}/av1state.txt" ||
+    { cat "${B}/av1state.txt"; return 1; }
+}
+check "a refused AV1 sample leaves the parser consistent" av1state
 check "only AMD's accelerator is taken" "${B}/acceltest"
 
 if (( ${#failed} )); then

@@ -61,6 +61,7 @@ struct VcnAV1 {
   void* bsAddr[NUM_BS];
   int bsNext;
   uint32_t maxW, maxH;
+  io_service_t svc;  // the accelerator handed to the driver; ours to release
   AV1Parser parser;
   CVPixelBufferRef dpb[NUM_DPB];  // last picture decoded into each DPB slot
                                   // (kept for show_existing_frame)
@@ -190,6 +191,7 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   if (!create) FAIL("no AVD_CreateAVDAccelerator");
   io_service_t svc = vcn_find_accelerator();
   if (!svc) FAIL("no AMD accelerator");
+  d->svc = svc;
   uint32_t services[8] = {svc};
   AVD_AcceleratorCreate ac = {
       .index = 0, .services = services, .validMask = 0xffffffff};
@@ -250,6 +252,8 @@ void vcnav1_destroy(VcnAV1* d) {
   for (int i = 0; i < NUM_DPB; i++)
     if (d->dpb[i]) CVPixelBufferRelease(d->dpb[i]);
   if (d->pool) CVPixelBufferPoolRelease(d->pool);
+  // Released only after the driver is gone: it may hold on to the service.
+  if (d->svc) IOObjectRelease(d->svc);
   av1_parser_free(&d->parser);
   free(d->seq);
   free(d->frame);
@@ -522,8 +526,12 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   const AV1Frame* h = &p->fh;
   if (kind == AV1_PARSE_SHOW_EXISTING) {
     AV1RefSlot* r = &p->ref[h->frame_to_show_map_idx];
-    if (r->dpb_slot >= 0 && d->dpb[r->dpb_slot] && d->out)
-      d->out(d->outCtx, d->dpb[r->dpb_slot], p, d->tag);
+    if (!r->valid || r->dpb_slot < 0 || r->dpb_slot >= NUM_DPB ||
+        !d->dpb[r->dpb_slot]) {
+      snprintf(d->err, sizeof(d->err), "show_existing of a missing reference");
+      return -1;
+    }
+    if (d->out) d->out(d->outCtx, d->dpb[r->dpb_slot], p, d->tag);
     if (h->frame_type == AV1_KEY_FRAME) {
       av1_reference_update(p, r->dpb_slot);
       release_slot_refs(d);
@@ -534,6 +542,22 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   double tf0 = timing ? tnow_ms() : 0;
   bool tenBit = p->seq.BitDepth > 8;
   uint32_t w = h->UpscaledWidth, hh = h->FrameHeight;
+  // 5.9.2: every reference of an inter frame must hold a decoded picture. A
+  // reference without one would make the engine read the slot it writes.
+  if (!h->FrameIsIntra)
+    for (int i = 0; i < 7; i++) {
+      const AV1RefSlot* r = &p->ref[h->ref_frame_idx[i]];
+      if (!r->valid || r->dpb_slot < 0 || r->dpb_slot >= NUM_DPB ||
+          !d->dpb[r->dpb_slot]) {
+        snprintf(d->err, sizeof(d->err), "missing reference");
+        return -1;
+      }
+    }
+  if (w > d->maxW || hh > d->maxH) {
+    snprintf(d->err, sizeof(d->err), "%ux%u is over the session maximum", w,
+             hh);
+    return -1;
+  }
   int slot = alloc_dpb_slot(d);
   if (slot < 0) {
     snprintf(d->err, sizeof(d->err), "no free DPB slot");
@@ -610,6 +634,7 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
   d->out = fn;
   d->outCtx = ctx;
   d->tag = userTag;
+  d->err[0] = 0;
   int r = av1_parse_temporal_unit(&d->parser, tu, size, on_frame, d);
   if (r && !d->err[0])
     snprintf(d->err, sizeof(d->err), "bitstream parse error");

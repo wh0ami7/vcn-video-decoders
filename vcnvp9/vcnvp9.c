@@ -69,6 +69,7 @@ struct VcnVP9 {
   void* bsAddr[NUM_BS];
   int bsNext;
   uint32_t maxW, maxH;
+  io_service_t svc;  // the accelerator handed to the driver; ours to release
   VP9Parser parser;
   CVPixelBufferRef dpb[NUM_DPB];
   int dpbRefs[NUM_DPB];
@@ -543,6 +544,7 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   if (!create) FAIL("no AVD_CreateAVDAccelerator");
   io_service_t svc = vcn_find_accelerator();
   if (!svc) FAIL("no AMD accelerator");
+  d->svc = svc;
   uint32_t services[8] = {svc};
   AVD_AcceleratorCreate ac = {
       .index = 0, .services = services, .validMask = 0xffffffff};
@@ -620,6 +622,8 @@ void vcnvp9_destroy(VcnVP9* d) {
   for (int i = 0; i < NUM_DPB; i++)
     if (d->dpb[i]) CVPixelBufferRelease(d->dpb[i]);
   if (d->pool) CVPixelBufferPoolRelease(d->pool);
+  // Released only after the driver is gone: it may hold on to the service.
+  if (d->svc) IOObjectRelease(d->svc);
   free(d->seq);
   free(d->frame);
   free(d->bsinfo);

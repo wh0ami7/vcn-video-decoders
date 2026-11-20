@@ -1321,6 +1321,8 @@ static int tile_group(AV1Parser* p, const uint8_t* data, size_t sz,
     tg_end = f(&b, tileBits);
     if (tg_start < 0 || tg_end < tg_start || tg_end >= NumTiles) return -1;
   }
+  // 5.11.1: each tile group starts where the previous one ended.
+  if (tg_start != p->next_tile) return -1;
   byte_alignment(&b);
   size_t pos = b.pos / 8;
   if (b.overrun || pos > sz) return -1;
@@ -1338,17 +1340,17 @@ static int tile_group(AV1Parser* p, const uint8_t* data, size_t sz,
       tileSize = t + 1;
       pos += h->TileSizeBytes;
     }
-    if (tileSize > sz - pos) return -1;
+    if (!tileSize || tileSize > sz - pos) return -1;
     if (append_tile(p, tileRow, tileCol, data + pos, tileSize)) return -1;
     pos += tileSize;
   }
+  p->next_tile = tg_end + 1;
   *lastTileGroup = tg_end == NumTiles - 1;
   return 0;
 }
 
-int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
-                            AV1FrameCallback cb, void* ctx) {
-  if (!p || (!data && size)) return -1;
+static int parse_obus(AV1Parser* p, const uint8_t* data, size_t size,
+                      AV1FrameCallback cb, void* ctx) {
   size_t off = 0;
   while (off < size) {
     uint8_t hdr = data[off];
@@ -1400,7 +1402,14 @@ int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
         if (p->have_frame_header && obu_type != OBU_FRAME)
           break;  // redundant copy
         BR b = {payload, obu_size, 0, false};
-        if (uncompressed_header(&b, p)) return -1;
+        // The header code updates the reference state as it reads; a header
+        // that turns out to be invalid must leave it as it was.
+        AV1RefSlot saved[AV1_NUM_REF_FRAMES];
+        memcpy(saved, p->ref, sizeof(saved));
+        if (uncompressed_header(&b, p)) {
+          memcpy(p->ref, saved, sizeof(saved));
+          return -1;
+        }
         if (p->fh.show_existing_frame) {
           p->have_frame_header = false;
           if (!cb) return -1;
@@ -1410,6 +1419,7 @@ int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
         }
         p->have_frame_header = true;
         p->num_tiles = 0;
+        p->next_tile = 0;
         p->tile_data_size = 0;
         if (obu_type == OBU_FRAME) {
           byte_alignment(&b);
@@ -1444,6 +1454,21 @@ int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
     }
   }
   return 0;
+}
+
+int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
+                            AV1FrameCallback cb, void* ctx) {
+  if (!p || (!data && size)) return -1;
+  int r = parse_obus(p, data, size, cb, ctx);
+  if (r) {
+    // Never let a later tile group complete a frame whose header or tiles
+    // were refused.
+    p->have_frame_header = false;
+    p->num_tiles = 0;
+    p->next_tile = 0;
+    p->tile_data_size = 0;
+  }
+  return r;
 }
 
 static int config_obu_noop(void* ctx, AV1Parser* parser, AV1ParseResult kind) {

@@ -149,6 +149,7 @@ typedef struct {
   size_t tile_data_size, tile_data_cap;
   AV1Tile tiles[AV1_MAX_TILE_COLS * AV1_MAX_TILE_ROWS];
   int num_tiles;
+  int next_tile;  // first tile the next tile group must start at
   int temporal_id, spatial_id;
 } AV1Parser;
 
