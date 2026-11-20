@@ -23,7 +23,14 @@
 //  12. a start that invalidate overtakes closes its new session again;
 //  13. an invalidate on another thread while a decode waits for a queue slot
 //      returns only after that decode has left the plug-in, and the frame is
-//      refused.
+//      refused;
+//  14. finalize from inside the output callback (the host lets go of the
+//      decoder there, and CoreMedia frees its storage when finalize returns),
+//      with frames still queued and a synchronous decode on another thread
+//      waiting for the queue: nothing freed is used (the address sanitizer
+//      stops the program if it is), nothing more is emitted, every queued
+//      frame lets go of its sample, and the session ends once and not while
+//      a frame decodes.
 //
 // usage: plugintest   (exit status 0 = pass)
 #include <dispatch/dispatch.h>
@@ -33,9 +40,13 @@
 #include <unistd.h>
 
 // The plug-in's semaphore waits go through test_semaphore_wait, so that test
-// 13 can hold a decode between taking a queue slot and queuing its frame.
+// 13 can hold a decode between taking a queue slot and queuing its frame, and
+// its dispatch_sync calls through test_dispatch_sync, so that test 14 knows
+// when a synchronous decode is on its way into the queue.
 static long test_semaphore_wait(dispatch_semaphore_t sem, dispatch_time_t t);
+static void test_dispatch_sync(dispatch_queue_t q, dispatch_block_t b);
 #define dispatch_semaphore_wait test_semaphore_wait
+#define dispatch_sync test_dispatch_sync
 #if defined(TEST_AV1)
 #include "../vtav1/AV1VCNDecoder.c"
 #define CODEC kCMVideoCodecType_AV1
@@ -52,6 +63,7 @@ typedef VcnVP9OutputFn OutputFn;
 #error "build with -DTEST_AV1 or -DTEST_VP9"
 #endif
 #undef dispatch_semaphore_wait
+#undef dispatch_sync
 
 // Run once, by the next plug-in wait that returns, before the plug-in goes on.
 static void (*afterWait)(void);
@@ -62,6 +74,11 @@ static long test_semaphore_wait(dispatch_semaphore_t sem, dispatch_time_t t) {
   void (*hook)(void) = __atomic_exchange_n(&afterWait, NULL, __ATOMIC_SEQ_CST);
   if (hook) hook();
   return r;
+}
+static int syncsStarted;
+static void test_dispatch_sync(dispatch_queue_t q, dispatch_block_t b) {
+  __atomic_add_fetch(&syncsStarted, 1, __ATOMIC_SEQ_CST);
+  dispatch_sync(q, b);
 }
 
 static int failures;
@@ -142,6 +159,11 @@ static int configureResult;
 #endif
 static CVPixelBufferRef picture;
 
+// Decodes running in the stand-in session; a session destroyed while one runs
+// sets destroyedWhileDecoding. A session is freed when it is destroyed, so a
+// decode on it afterwards is a use after free.
+static int decodesRunning;
+static bool destroyedWhileDecoding;
 static Vcn* fake_create(void) {
   if (failCreate) return NULL;
   if (invalidateInCreate) base_invalidate((CMBaseObjectRef)invalidateInCreate);
@@ -149,8 +171,17 @@ static Vcn* fake_create(void) {
   return (Vcn*)calloc(1, sizeof(struct Fake));
 }
 static void fake_destroy(Vcn* d) {
-  destroys++;
+  if (__atomic_load_n(&decodesRunning, __ATOMIC_SEQ_CST))
+    destroyedWhileDecoding = true;
+  __atomic_add_fetch(&destroys, 1, __ATOMIC_SEQ_CST);
   free(d);
+}
+static void fake_decode_begin(Vcn* d) {
+  __atomic_add_fetch(&decodesRunning, 1, __ATOMIC_SEQ_CST);
+  ((struct Fake*)d)->unused++;  // reads and writes the session
+}
+static void fake_decode_end(void) {
+  __atomic_sub_fetch(&decodesRunning, 1, __ATOMIC_SEQ_CST);
 }
 
 #if defined(TEST_AV1)
@@ -179,10 +210,12 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 }
 int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t tag,
                   VcnAV1OutputFn fn, void* ctx) {
-  (void)d, (void)size;
+  (void)size;
+  fake_decode_begin(d);
   if (tu[0] == 5) slow_decode();
   if (tu[0] == 1 || tu[0] == 2 || tu[0] == 5) fn(ctx, picture, NULL, tag);
   lastFailure = fake_failure(tu[0]);
+  fake_decode_end();
   return tu[0] >= 2 && tu[0] <= 4 ? -1 : 0;
 }
 int vcnav1_failure(VcnAV1* d) {
@@ -211,11 +244,13 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
 }
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
                   VcnVP9OutputFn fn, void* ctx) {
-  (void)d, (void)size;
+  (void)size;
+  fake_decode_begin(d);
   if (chunk[0] == 5) slow_decode();
   if (chunk[0] == 1 || chunk[0] == 2 || chunk[0] == 5)
     fn(ctx, picture, NULL, 16, 16, tag);
   lastFailure = fake_failure(chunk[0]);
+  fake_decode_end();
   return chunk[0] >= 2 && chunk[0] <= 4 ? -1 : 0;
 }
 int vcnvp9_failure(VcnVP9* d) {
@@ -320,6 +355,24 @@ static void* invalidating(void* arg) {
   return NULL;
 }
 
+// Test 14: the output callback lets go of the decoder, as a host that releases
+// its session there does: finalize, and then CoreMedia frees the storage.
+static bool finalizedInCallback;
+static void finalize_in_callback(void) {
+  VTVideoDecoderRef d = dec;
+  dec = NULL;
+  base_finalize((CMBaseObjectRef)d);
+  free(d);
+  finalizedInCallback = true;
+}
+static CMSampleBufferRef syncSample;
+static bool syncLeft;
+static void* sync_decode(void* arg) {
+  dec_decode_frame((VTVideoDecoderRef)arg, NULL, syncSample, 0, NULL);
+  __atomic_store_n(&syncLeft, true, __ATOMIC_SEQ_CST);
+  return NULL;
+}
+
 static void hung(int sig) {
   (void)sig;
   static const char msg[] = "FAIL a call from inside the callback hung\n";
@@ -329,6 +382,7 @@ static void hung(int sig) {
 
 int main(void) {
   int d0;
+  setvbuf(stdout, NULL, _IOLBF, 0);  // what passed is kept if a test crashes
   signal(SIGALRM, hung);
   alarm(30);
   CVPixelBufferCreate(NULL, 16, 16,
@@ -522,6 +576,63 @@ int main(void) {
   base_finalize((CMBaseObjectRef)dec);
   free(dec);
   CFRelease(slow13);
+
+  // 14. A slow frame decodes, two more wait behind it and a synchronous decode
+  // on another thread waits for the queue. The slow frame's callback lets go
+  // of the decoder.
+  expect("a decoder for the finalize from the callback test",
+         !CREATE(CODEC, NULL, &dec) && dec);
+  expect("its session starts as well", !dec_start_session(dec, NULL, fmt));
+  slowEntered = dispatch_semaphore_create(0);
+  slowRelease = dispatch_semaphore_create(0);
+  slowTimedOut = false;
+  CMSampleBufferRef slow14 = sample(5), behind[2] = {sample(1), sample(1)};
+  syncSample = sample(1);
+  e = emits;
+  c0 = creates;
+  d0 = destroys;
+  dec_decode_frame(dec, NULL, slow14,
+                   kVTDecodeFrame_EnableAsynchronousDecompression, NULL);
+  bool busy = !dispatch_semaphore_wait(
+      slowEntered, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  for (int i = 0; i < 2; i++)
+    dec_decode_frame(dec, NULL, behind[i],
+                     kVTDecodeFrame_EnableAsynchronousDecompression, NULL);
+  int s0 = __atomic_load_n(&syncsStarted, __ATOMIC_SEQ_CST);
+  pthread_t tc;
+  pthread_create(&tc, NULL, sync_decode, dec);
+  // Until the decode is on its way into dispatch_sync (at most 2 s), and a
+  // little longer for it to be waiting there.
+  for (int i = 0;
+       i < 2000 && __atomic_load_n(&syncsStarted, __ATOMIC_SEQ_CST) == s0; i++)
+    usleep(1000);
+  usleep(50000);
+  bool syncWaiting = __atomic_load_n(&syncsStarted, __ATOMIC_SEQ_CST) > s0 &&
+                     !__atomic_load_n(&syncLeft, __ATOMIC_SEQ_CST);
+  inCallback = finalize_in_callback;
+  dispatch_semaphore_signal(slowRelease);
+  pthread_join(tc, NULL);
+  // Until every frame queued has let go of its sample (at most 5 s).
+  CMSampleBufferRef held[] = {slow14, behind[0], behind[1], syncSample};
+  bool released = false;
+  for (int i = 0; i < 5000 && !released; i++) {
+    released = true;
+    for (int j = 0; j < 4; j++)
+      if (CFGetRetainCount(held[j]) != 1) released = false;
+    if (!released) usleep(1000);
+  }
+  usleep(100000);  // the last frame's block lets go of the state after that
+  expect(
+      "test 14 set-up: a frame decodes, two wait, a synchronous decode "
+      "waits for the queue, and the callback finalizes",
+      busy && syncWaiting && finalizedInCallback && !slowTimedOut);
+  expect(
+      "after finalize from the callback the frames still queued emit "
+      "nothing, and let go of their samples",
+      emits == e + 1 && released && syncLeft);
+  expect("the session ends once, and not while a frame decodes",
+         creates == c0 && destroys == d0 + 1 && !destroyedWhileDecoding);
+  for (int j = 0; j < 4; j++) CFRelease(held[j]);
 
 #if defined(TEST_AV1)
   // av1C: marker/version, profile 0 level 0, 8-bit 4:2:0, then one config byte.

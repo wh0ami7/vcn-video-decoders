@@ -86,12 +86,22 @@ extern OSStatus VTDecoderSessionEmitDecodedFrame(VTVideoDecoderSession,
 
 // ---- decoder instance
 // ----------------------------------------------------------------------
+// What the decode queue and the calls still inside the plug-in use. It lives
+// apart from the CoreMedia storage, which CoreMedia frees as soon as finalize
+// returns, and it is counted: the storage holds one reference, each queued
+// frame one and each call in the plug-in one, and the last to let go frees
+// it. finalize can run on the decode queue (a host that lets go of its session
+// from inside its output callback), where it may wait for nothing: the frames
+// still queued and a call waiting for the queue then find the state alive,
+// closed, and emit nothing.
 typedef struct {
   VTVideoDecoderSession session;
   VcnAV1* vcn;
   int32_t width, height;
   bool tenBit;
-  bool invalidated;  // set by invalidate, once the queue is drained
+  // Set by invalidate once the queue is drained, and by finalize: nothing is
+  // emitted any more.
+  bool invalidated;
   CVPixelBufferRef
       lastFrame;  // retained output of the temporal unit being decoded
   pthread_mutex_t lock;
@@ -114,6 +124,12 @@ typedef struct {
   // = enqueue -> start
   int st_n, st_over, st_depth_max, depth;
   double st_dec_sum, st_dec_max, st_q_sum, st_q_max, st_t0;
+  int refs;  // see above; changed with atomics only
+} State;
+
+// The CoreMedia storage of the decoder object.
+typedef struct {
+  State* state;  // NULL once finalized
 } Storage;
 
 #define STATS_EVERY 120
@@ -138,7 +154,7 @@ static long g_started, g_ended, g_live;
 
 // Sets the format canAcceptFormatDescription compares with (NULL: none), for
 // a session that starts or ends. Either way the session is not broken.
-static void set_format(Storage* s, CMVideoFormatDescriptionRef fmt) {
+static void set_format(State* s, CMVideoFormatDescriptionRef fmt) {
   pthread_mutex_lock(&s->meta);
   CMVideoFormatDescriptionRef old = s->format;
   s->format = fmt ? (CMVideoFormatDescriptionRef)CFRetain(fmt) : NULL;
@@ -149,7 +165,7 @@ static void set_format(Storage* s, CMVideoFormatDescriptionRef fmt) {
 
 // Ends the decoder session, if there is one, and logs it with the counts. The
 // caller holds s->lock or is the only one left using s.
-static void end_session(Storage* s, const char* why) {
+static void end_session(State* s, const char* why) {
   set_format(s, NULL);
   if (!s->vcn) return;
   vcnav1_destroy(s->vcn);
@@ -163,20 +179,50 @@ static void end_session(Storage* s, const char* why) {
               s->width, s->height, why, started, ended, live);
 }
 
-static Storage* storage_of(VTVideoDecoderRef dec) {
-  return CMBaseObjectGetDerivedStorage(VTVideoDecoderGetCMBaseObject(dec));
+static State* state_retain(State* s) {
+  __atomic_add_fetch(&s->refs, 1, __ATOMIC_RELAXED);
+  return s;
+}
+// The last one frees the state. Nothing is queued and no call is inside the
+// plug-in by then: no lock is held, nobody waits on the semaphore and every
+// slot has been given back.
+static void state_release(State* s) {
+  if (__atomic_sub_fetch(&s->refs, 1, __ATOMIC_ACQ_REL)) return;
+  end_session(s, "finalized");  // finalize ended it already: only the format
+  if (s->lastFrame) CVPixelBufferRelease(s->lastFrame);
+  if (s->queue) dispatch_release(s->queue);
+  if (s->slots) dispatch_release(s->slots);
+  pthread_mutex_destroy(&s->lock);
+  pthread_mutex_destroy(&s->meta);
+  pthread_cond_destroy(&s->idle);
+  free(s);
+}
+
+// The state of a decoder, without a reference: for calls that wait for
+// nothing.
+static State* state_of(VTVideoDecoderRef dec) {
+  Storage* st =
+      CMBaseObjectGetDerivedStorage(VTVideoDecoderGetCMBaseObject(dec));
+  return st->state;
+}
+// The same with a reference, for a call that may wait for the decode queue:
+// it keeps the state alive until the call lets go, also if the decoder is
+// finalized meanwhile. NULL after finalize.
+static State* state_enter(VTVideoDecoderRef dec) {
+  State* s = state_of(dec);
+  return s ? state_retain(s) : NULL;
 }
 
 // Marks the decode queue. The output callback runs on it, and a call made from
 // inside the callback must not wait for the queue, which is busy running it.
 static char kQueueKey;
-static bool on_queue(Storage* s) {
+static bool on_queue(State* s) {
   return dispatch_get_specific(&kQueueKey) == s;
 }
 // Waits until every queued frame has been emitted, also those queued from
 // inside the callback while it waited. From inside the callback the frames
 // queued after the running one cannot be waited for.
-static void drain(Storage* s) {
+static void drain(State* s) {
   if (!s->queue || on_queue(s)) return;
   do
     dispatch_sync(s->queue, ^{
@@ -187,19 +233,19 @@ static void drain(Storage* s) {
 // A decodeFrame call from outside the decode queue counts itself in callers
 // for as long as it runs. Returns false, counting nothing, once invalidate or
 // finalize has begun.
-static bool enter_call(Storage* s, bool counted) {
+static bool enter_call(State* s, bool counted) {
   pthread_mutex_lock(&s->meta);
   bool open = !s->closing;
   if (open && counted) s->callers++;
   pthread_mutex_unlock(&s->meta);
   return open;
 }
-static void leave_call(Storage* s) {
+static void leave_call(State* s) {
   pthread_mutex_lock(&s->meta);
   if (--s->callers == 0) pthread_cond_broadcast(&s->idle);
   pthread_mutex_unlock(&s->meta);
 }
-static bool is_closing(Storage* s) {
+static bool is_closing(State* s) {
   pthread_mutex_lock(&s->meta);
   bool closing = s->closing;
   pthread_mutex_unlock(&s->meta);
@@ -210,8 +256,9 @@ static bool is_closing(Storage* s) {
 // waits for a slot has not queued its frame yet. From the decode queue (the
 // output callback) nothing is waited for: a call waiting for a slot may be
 // waiting for the frame whose callback this is. Such a call refuses its frame
-// once it gets the slot, and finalize, which runs off the queue, waits for it.
-static void close_calls(Storage* s) {
+// once it gets the slot, and its own reference keeps the state until it has
+// left, also when finalize runs on the queue.
+static void close_calls(State* s) {
   pthread_mutex_lock(&s->meta);
   s->closing = true;
   if (!on_queue(s))
@@ -236,7 +283,9 @@ static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
 // ---- CMBaseClass
 // ---------------------------------------------------------------------------
 static OSStatus base_invalidate(CMBaseObjectRef obj) {
-  Storage* s = CMBaseObjectGetDerivedStorage(obj);
+  Storage* st = CMBaseObjectGetDerivedStorage(obj);
+  if (!st->state) return noErr;
+  State* s = state_retain(st->state);
   // Frames handed in from now on are refused; the ones already queued are
   // still emitted.
   close_calls(s);
@@ -246,19 +295,30 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
   __atomic_store_n(&s->invalidated, true, __ATOMIC_RELAXED);
   end_session(s, "invalidated");
   pthread_mutex_unlock(&s->lock);
+  state_release(s);
   return noErr;
 }
 
+// Off the decode queue this waits, as invalidate does, for the calls still on
+// their way in and for every queued frame. On the queue (the host let go of
+// the decoder from inside its output callback) it waits for neither: the
+// frames queued behind the running one and a call waiting for the queue on
+// another thread still hold the state, run after this returns and emit
+// nothing. Either way the session ends here, once, under lock: a decode holds
+// lock for as long as the GPU works on its frame, and on the queue the frame
+// whose callback this is has finished with the GPU before it emits.
 static void base_finalize(CMBaseObjectRef obj) {
-  Storage* s = CMBaseObjectGetDerivedStorage(obj);
-  close_calls(s);  // nothing below may go while a decodeFrame still uses it
+  Storage* st = CMBaseObjectGetDerivedStorage(obj);
+  State* s = st->state;
+  if (!s) return;
+  st->state = NULL;
+  close_calls(s);
   drain(s);
+  pthread_mutex_lock(&s->lock);
+  __atomic_store_n(&s->invalidated, true, __ATOMIC_RELAXED);
   end_session(s, "finalized");  // releases the format too
-  if (s->queue) dispatch_release(s->queue);
-  if (s->slots) dispatch_release(s->slots);
-  pthread_mutex_destroy(&s->lock);
-  pthread_mutex_destroy(&s->meta);
-  pthread_cond_destroy(&s->idle);
+  pthread_mutex_unlock(&s->lock);
+  state_release(s);  // the storage's reference: the last one frees the state
 }
 
 static CFStringRef base_copy_debug_description(CMBaseObjectRef obj) {
@@ -285,10 +345,8 @@ static OSStatus base_set_property(CMBaseObjectRef obj, CFStringRef key,
 
 // ---- VTVideoDecoderClass
 // -------------------------------------------------------------------
-static OSStatus dec_start_session(VTVideoDecoderRef dec,
-                                  VTVideoDecoderSession session,
-                                  CMVideoFormatDescriptionRef fmt) {
-  Storage* s = storage_of(dec);
+static OSStatus start_session(State* s, VTVideoDecoderSession session,
+                              CMVideoFormatDescriptionRef fmt) {
   if (!fmt) return kVTParameterErr;
   CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
   if (dim.width <= 0 || dim.height <= 0)
@@ -381,10 +439,19 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
          width, height, tenBit ? "10-bit" : "8-bit", started, ended, live);
   return noErr;
 }
+static OSStatus dec_start_session(VTVideoDecoderRef dec,
+                                  VTVideoDecoderSession session,
+                                  CMVideoFormatDescriptionRef fmt) {
+  State* s = state_enter(dec);  // it waits for the queue
+  if (!s) return kVTInvalidSessionErr;
+  OSStatus r = start_session(s, session, fmt);
+  state_release(s);
+  return r;
+}
 
 static void on_output(void* ctx, CVPixelBufferRef frame, const AV1Parser* p,
                       int64_t tag) {
-  Storage* s = ctx;
+  State* s = ctx;
   // A temporal unit has exactly one shown frame; keep the last one if a stream
   // breaks that rule.
   if (s->lastFrame) CVPixelBufferRelease(s->lastFrame);
@@ -397,7 +464,7 @@ static double now_ms(void) {
   return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
 }
 
-static void stats_add(Storage* s, double queued, double decode) {
+static void stats_add(State* s, double queued, double decode) {
   if (!s->st_n) s->st_t0 = now_ms();
   s->st_n++;
   s->st_dec_sum += decode;
@@ -439,7 +506,7 @@ static OSStatus decode_status(int failure) {
 }
 
 // Decode one temporal unit and hand its shown frame to VideoToolbox.
-static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
+static void decode_and_emit(State* s, VTVideoDecoderFrame frame,
                             CMSampleBufferRef sbuf, double enqueued) {
   double started = now_ms();
   CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sbuf);
@@ -495,13 +562,10 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
   if (out) CVPixelBufferRelease(out);
 }
 
-static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
-                                 VTVideoDecoderFrame frame,
-                                 CMSampleBufferRef sbuf,
-                                 VTDecodeFrameFlags flags,
-                                 VTDecodeInfoFlags* infoOut) {
-  Storage* s = storage_of(dec);
-  if (infoOut) *infoOut = 0;
+// The caller holds a reference to s for as long as this runs.
+static OSStatus decode_frame(State* s, VTVideoDecoderFrame frame,
+                             CMSampleBufferRef sbuf, VTDecodeFrameFlags flags,
+                             VTDecodeInfoFlags* infoOut) {
   if (!sbuf) return kVTParameterErr;
   // From inside the output callback the queue is already running this code,
   // and invalidate run from there waits for no call (see close_calls).
@@ -532,16 +596,30 @@ static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
   CFRetain(sbuf);
   double t = now_ms();
   __atomic_add_fetch(&s->depth, 1, __ATOMIC_RELAXED);
+  state_retain(s);  // the frame's own reference, let go of last
   dispatch_async(s->queue, ^{
     decode_and_emit(s, frame, sbuf, t);
     __atomic_sub_fetch(&s->depth, 1, __ATOMIC_RELAXED);
     CFRelease(sbuf);
     if (counted) dispatch_semaphore_signal(s->slots);
+    state_release(s);
   });
   if (infoOut) *infoOut = kVTDecodeInfo_Asynchronous;
   // Queued and counted in depth: from here on drain() waits for the frame.
   if (counted) leave_call(s);
   return noErr;
+}
+static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
+                                 VTVideoDecoderFrame frame,
+                                 CMSampleBufferRef sbuf,
+                                 VTDecodeFrameFlags flags,
+                                 VTDecodeInfoFlags* infoOut) {
+  if (infoOut) *infoOut = 0;
+  State* s = state_enter(dec);
+  if (!s) return kVTInvalidSessionErr;
+  OSStatus r = decode_frame(s, frame, sbuf, flags, infoOut);
+  state_release(s);
+  return r;
 }
 
 static OSStatus dec_copy_supported_properties(VTVideoDecoderRef dec,
@@ -566,8 +644,8 @@ static OSStatus dec_copy_supported_properties(VTVideoDecoderRef dec,
 
 static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
                                      CMFormatDescriptionRef fmt) {
-  Storage* s = storage_of(dec);
-  if (!fmt) return false;
+  State* s = state_of(dec);
+  if (!s || !fmt) return false;
   // A decoder whose start failed, whose session broke or whose invalidate has
   // begun takes no format: VideoToolbox must make a new one. Read under meta,
   // not lock: a decode holds lock while the GPU works on its frame.
@@ -592,8 +670,10 @@ static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
 }
 
 static OSStatus dec_finish_delayed_frames(VTVideoDecoderRef dec) {
-  Storage* s = storage_of(dec);
+  State* s = state_enter(dec);
+  if (!s) return noErr;
   drain(s);  // every queued frame has been emitted when this returns
+  state_release(s);
   return noErr;
 }
 
@@ -627,11 +707,18 @@ __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
   OSStatus r =
       CMDerivedObjectCreate(alloc, &kVTable, VTVideoDecoderGetClassID(), &obj);
   if (r || !obj) return r ? r : kVTAllocationFailedErr;
-  Storage* s = CMBaseObjectGetDerivedStorage(obj);
-  memset(s, 0, sizeof(*s));
+  Storage* st = CMBaseObjectGetDerivedStorage(obj);
+  memset(st, 0, sizeof(*st));
+  State* s = calloc(1, sizeof(*s));
+  if (!s) {
+    CFRelease(obj);
+    return kVTAllocationFailedErr;
+  }
+  s->refs = 1;  // the storage's
   pthread_mutex_init(&s->lock, NULL);
   pthread_mutex_init(&s->meta, NULL);
   pthread_cond_init(&s->idle, NULL);
+  st->state = s;  // from here on finalize frees it
   s->queue = dispatch_queue_create(
       "com.droga.vtav1vcn.decode",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
