@@ -203,7 +203,7 @@ static void state_release(State* s) {
 static State* state_of(VTVideoDecoderRef dec) {
   Storage* st =
       CMBaseObjectGetDerivedStorage(VTVideoDecoderGetCMBaseObject(dec));
-  return st->state;
+  return __atomic_load_n(&st->state, __ATOMIC_ACQUIRE);
 }
 // The same with a reference, for a call that may wait for the decode queue:
 // it keeps the state alive until the call lets go, also if the decoder is
@@ -256,8 +256,9 @@ static bool is_closing(State* s) {
 // waits for a slot has not queued its frame yet. From the decode queue (the
 // output callback) nothing is waited for: a call waiting for a slot may be
 // waiting for the frame whose callback this is. Such a call refuses its frame
-// once it gets the slot, and its own reference keeps the state until it has
-// left, also when finalize runs on the queue.
+// once it gets the slot. Its own reference keeps the state until it has
+// left, as each queued frame's own does until the frame has run, also when
+// finalize runs on the queue.
 static void close_calls(State* s) {
   pthread_mutex_lock(&s->meta);
   s->closing = true;
@@ -284,8 +285,9 @@ static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
 // ---------------------------------------------------------------------------
 static OSStatus base_invalidate(CMBaseObjectRef obj) {
   Storage* st = CMBaseObjectGetDerivedStorage(obj);
-  if (!st->state) return noErr;
-  State* s = state_retain(st->state);
+  State* s = __atomic_load_n(&st->state, __ATOMIC_ACQUIRE);
+  if (!s) return noErr;
+  state_retain(s);
   // Frames handed in from now on are refused; the ones already queued are
   // still emitted.
   close_calls(s);
@@ -309,9 +311,8 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
 // whose callback this is has finished with the GPU before it emits.
 static void base_finalize(CMBaseObjectRef obj) {
   Storage* st = CMBaseObjectGetDerivedStorage(obj);
-  State* s = st->state;
+  State* s = __atomic_exchange_n(&st->state, NULL, __ATOMIC_ACQ_REL);
   if (!s) return;
-  st->state = NULL;
   close_calls(s);
   drain(s);
   pthread_mutex_lock(&s->lock);
@@ -606,6 +607,9 @@ static OSStatus decode_frame(State* s, VTVideoDecoderFrame frame,
   });
   if (infoOut) *infoOut = kVTDecodeInfo_Asynchronous;
   // Queued and counted in depth: from here on drain() waits for the frame.
+  // Until then the call is counted in callers, so an invalidate or finalize
+  // off the queue, which waits for callers before it drains, cannot miss it.
+  // On the queue they wait for no frame queued behind the running one.
   if (counted) leave_call(s);
   return noErr;
 }
@@ -718,17 +722,20 @@ __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
   pthread_mutex_init(&s->lock, NULL);
   pthread_mutex_init(&s->meta, NULL);
   pthread_cond_init(&s->idle, NULL);
-  st->state = s;  // from here on finalize frees it
   s->queue = dispatch_queue_create(
       "com.droga.vtav1vcn.decode",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
                                               QOS_CLASS_USER_INTERACTIVE, 0));
   s->slots = dispatch_semaphore_create(MAX_QUEUED);
   if (!s->queue || !s->slots) {
-    CFRelease(obj);
+    state_release(s);  // the only reference: frees what was made
+    CFRelease(obj);    // finalize finds no state
     return kVTAllocationFailedErr;
   }
   dispatch_queue_set_specific(s->queue, &kQueueKey, s, NULL);
+  // Published with release once it is set up; from here on finalize frees
+  // it.
+  __atomic_store_n(&st->state, s, __ATOMIC_RELEASE);
   *out = (VTVideoDecoderRef)obj;
   return noErr;
 }

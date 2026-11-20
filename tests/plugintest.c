@@ -30,9 +30,13 @@
 //      waiting for the queue: nothing freed is used (the address sanitizer
 //      stops the program if it is), nothing more is emitted, every queued
 //      frame lets go of its sample, and the session ends once and not while
-//      a frame decodes.
+//      a frame decodes;
+//  15. an invalidate on another thread while a decode has passed its check
+//      for invalidate and not yet queued its frame returns only after that
+//      decode has queued it, and the frame is emitted.
 //
 // usage: plugintest   (exit status 0 = pass)
+#include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <pthread.h>
 #include <signal.h>
@@ -40,13 +44,17 @@
 #include <unistd.h>
 
 // The plug-in's semaphore waits go through test_semaphore_wait, so that test
-// 13 can hold a decode between taking a queue slot and queuing its frame, and
-// its dispatch_sync calls through test_dispatch_sync, so that test 14 knows
-// when a synchronous decode is on its way into the queue.
+// 13 can hold a decode between taking a queue slot and queuing its frame; its
+// dispatch_sync calls through test_dispatch_sync, so that test 14 knows when a
+// synchronous decode is on its way into the queue; and its CFRetain calls
+// through test_CFRetain, so that test 15 can hold a decode at the retain of
+// its sample, after its check for invalidate and before it queues the frame.
 static long test_semaphore_wait(dispatch_semaphore_t sem, dispatch_time_t t);
 static void test_dispatch_sync(dispatch_queue_t q, dispatch_block_t b);
+static CFTypeRef test_CFRetain(CFTypeRef cf);
 #define dispatch_semaphore_wait test_semaphore_wait
 #define dispatch_sync test_dispatch_sync
+#define CFRetain test_CFRetain
 #if defined(TEST_AV1)
 #include "../vtav1/AV1VCNDecoder.c"
 #define CODEC kCMVideoCodecType_AV1
@@ -64,6 +72,7 @@ typedef VcnVP9OutputFn OutputFn;
 #endif
 #undef dispatch_semaphore_wait
 #undef dispatch_sync
+#undef CFRetain
 
 // Run once, by the next plug-in wait that returns, before the plug-in goes on.
 static void (*afterWait)(void);
@@ -79,6 +88,17 @@ static int syncsStarted;
 static void test_dispatch_sync(dispatch_queue_t q, dispatch_block_t b) {
   __atomic_add_fetch(&syncsStarted, 1, __ATOMIC_SEQ_CST);
   dispatch_sync(q, b);
+}
+// Run once, by the next plug-in CFRetain on the thread retainThread names.
+static void (*atRetain)(void);
+static pthread_t retainThread;
+static CFTypeRef test_CFRetain(CFTypeRef cf) {
+  if (__atomic_load_n(&atRetain, __ATOMIC_SEQ_CST) &&
+      pthread_equal(pthread_self(), retainThread)) {
+    void (*hook)(void) = __atomic_exchange_n(&atRetain, NULL, __ATOMIC_SEQ_CST);
+    if (hook) hook();
+  }
+  return CFRetain(cf);
 }
 
 static int failures;
@@ -373,6 +393,20 @@ static void* sync_decode(void* arg) {
   return NULL;
 }
 
+// Test 15: a decode held at the retain of its sample, after it found no
+// invalidate begun and before it queues its frame.
+static dispatch_semaphore_t retainHeld, retainHold;
+static void hold_at_retain(void) {
+  dispatch_semaphore_signal(retainHeld);
+  dispatch_semaphore_wait(retainHold,
+                          dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+}
+static void* held_decode(void* arg) {
+  retainThread = pthread_self();
+  __atomic_store_n(&atRetain, hold_at_retain, __ATOMIC_SEQ_CST);
+  return waiting_decode(arg);
+}
+
 static void hung(int sig) {
   (void)sig;
   static const char msg[] = "FAIL a call from inside the callback hung\n";
@@ -633,6 +667,41 @@ int main(void) {
   expect("the session ends once, and not while a frame decodes",
          creates == c0 && destroys == d0 + 1 && !destroyedWhileDecoding);
   for (int j = 0; j < 4; j++) CFRelease(held[j]);
+
+  // 15. A decode has found no invalidate begun and is held before it queues
+  // its frame; another thread invalidates. The decode is still counted as a
+  // call, so invalidate waits for it, and drains the frame it then queues.
+  expect("a decoder for the invalidate before a frame is queued test",
+         !CREATE(CODEC, NULL, &dec) && dec);
+  expect("its session starts, again", !dec_start_session(dec, NULL, fmt));
+  retainHeld = dispatch_semaphore_create(0);
+  retainHold = dispatch_semaphore_create(0);
+  invalidateDone = dispatch_semaphore_create(0);
+  order = decodeLeft = invalidateLeft = 0;
+  waitingResult = -1;
+  waitingSample = shown;
+  e = emits;
+  pthread_create(&ta, NULL, held_decode, NULL);
+  bool heldBeforeQueue = !dispatch_semaphore_wait(
+      retainHeld, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+  pthread_create(&tb, NULL, invalidating, NULL);
+  // Until invalidate has begun (at most 300 ms).
+  for (int i = 0; i < 300 && dec_can_accept_format(dec, fmt); i++) usleep(1000);
+  // An invalidate that does not wait for the decode is done within a second.
+  bool invalidateEarly = !dispatch_semaphore_wait(
+      invalidateDone, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
+  dispatch_semaphore_signal(retainHold);
+  pthread_join(ta, NULL);
+  pthread_join(tb, NULL);
+  expect("test 15 set-up: a decode is held after its check, before it queues",
+         heldBeforeQueue);
+  expect("invalidate waits for a decode that passed its check",
+         !invalidateEarly && decodeLeft && invalidateLeft &&
+             decodeLeft < invalidateLeft);
+  expect("and the frame that decode queued is emitted",
+         waitingResult == noErr && emits == e + 1 && !lastStatus);
+  base_finalize((CMBaseObjectRef)dec);
+  free(dec);
 
 #if defined(TEST_AV1)
   // av1C: marker/version, profile 0 level 0, 8-bit 4:2:0, then one config byte.
