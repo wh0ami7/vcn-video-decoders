@@ -45,7 +45,7 @@ nm $KX/Contents/MacOS/VCNEncodeFloor | grep -q ' D _kmod_info' || { print "kmod_
 
 print "== vcnencodefix"
 TFLAGS=(-arch x86_64 -mmacosx-version-min=26.0 -O2 -Wall -Wextra -Werror -fblocks "-DVERSION=\"$VERSION\"")
-xcrun clang $TFLAGS tool/vcnencodefix.c tool/patches.c tool/efi.c -framework CoreFoundation -o $B/vcnencodefix
+xcrun clang $TFLAGS tool/vcnencodefix.c tool/patches.c tool/efi.c tool/ocentry.c -framework CoreFoundation -o $B/vcnencodefix
 codesign -f -s - -i com.droga.vcnencodefix $B/vcnencodefix 2>/dev/null
 
 print "== vtenc (test encoder)"
