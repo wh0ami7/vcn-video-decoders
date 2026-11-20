@@ -92,7 +92,7 @@ typedef struct {
   VcnAV1* vcn;
   int32_t width, height;
   bool tenBit;
-  bool emitted;
+  bool invalidated;  // set by invalidate, once the queue is drained
   CVPixelBufferRef
       lastFrame;  // retained output of the temporal unit being decoded
   pthread_mutex_t lock;
@@ -125,6 +125,23 @@ static Storage* storage_of(VTVideoDecoderRef dec) {
   return CMBaseObjectGetDerivedStorage(VTVideoDecoderGetCMBaseObject(dec));
 }
 
+// Marks the decode queue. The output callback runs on it, and a call made from
+// inside the callback must not wait for the queue, which is busy running it.
+static char kQueueKey;
+static bool on_queue(Storage* s) {
+  return dispatch_get_specific(&kQueueKey) == s;
+}
+// Waits until every queued frame has been emitted, also those queued from
+// inside the callback while it waited. From inside the callback the frames
+// queued after the running one cannot be waited for.
+static void drain(Storage* s) {
+  if (!s->queue || on_queue(s)) return;
+  do
+    dispatch_sync(s->queue, ^{
+                  });
+  while (__atomic_load_n(&s->depth, __ATOMIC_RELAXED) > 0);
+}
+
 static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
   CFDictionaryRef atoms = CMFormatDescriptionGetExtension(
       fmt, kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
@@ -143,10 +160,10 @@ static CFDataRef copy_av1C(CMFormatDescriptionRef fmt) {
 // ---------------------------------------------------------------------------
 static OSStatus base_invalidate(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
-  if (s->queue)
-    dispatch_sync(s->queue, ^{
-                  });
+  drain(s);
   pthread_mutex_lock(&s->lock);
+  // Frames handed in from now on are refused, and none is emitted any more.
+  __atomic_store_n(&s->invalidated, true, __ATOMIC_RELAXED);
   if (s->vcn) {
     vcnav1_destroy(s->vcn);
     s->vcn = NULL;
@@ -157,9 +174,7 @@ static OSStatus base_invalidate(CMBaseObjectRef obj) {
 
 static void base_finalize(CMBaseObjectRef obj) {
   Storage* s = CMBaseObjectGetDerivedStorage(obj);
-  if (s->queue)
-    dispatch_sync(s->queue, ^{
-                  });
+  drain(s);
   if (s->vcn) vcnav1_destroy(s->vcn);
   if (s->format) CFRelease(s->format);
   if (s->queue) dispatch_release(s->queue);
@@ -174,6 +189,7 @@ static CFStringRef base_copy_debug_description(CMBaseObjectRef obj) {
 
 static OSStatus base_copy_property(CMBaseObjectRef obj, CFStringRef key,
                                    CFAllocatorRef alloc, void* out) {
+  if (!key || !out) return kVTParameterErr;
   if (CFEqual(
           key,
           kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder)) {
@@ -194,10 +210,21 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
                                   VTVideoDecoderSession session,
                                   CMVideoFormatDescriptionRef fmt) {
   Storage* s = storage_of(dec);
+  if (!fmt) return kVTParameterErr;
+  CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
+  if (dim.width <= 0 || dim.height <= 0)
+    return kVTVideoDecoderUnsupportedDataFormatErr;
+  // A second start replaces the decoder of the first one.
+  drain(s);
+  pthread_mutex_lock(&s->lock);
+  if (s->vcn) {
+    vcnav1_destroy(s->vcn);
+    s->vcn = NULL;
+  }
+  pthread_mutex_unlock(&s->lock);
   s->session = session;
   if (s->format) CFRelease(s->format);
   s->format = (CMVideoFormatDescriptionRef)CFRetain(fmt);
-  CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fmt);
   s->width = dim.width;
   s->height = dim.height;
   s->tenBit = false;
@@ -234,10 +261,19 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
     if (av1C) CFRelease(av1C);
     return kVTVideoDecoderNotAvailableNowErr;
   }
-  if (cfg && cfgLen > 4 && vcnav1_configure(s->vcn, cfg + 4, cfgLen - 4))
+  int cr =
+      cfg && cfgLen > 4 ? vcnav1_configure(s->vcn, cfg + 4, cfgLen - 4) : 0;
+  if (cr)
     os_log_error(logger(), "configOBUs rejected: %{public}s",
                  vcnav1_last_error(s->vcn));
   if (av1C) CFRelease(av1C);
+  // A sequence header the engine cannot decode: VideoToolbox can pick another
+  // decoder.
+  if (cr == VCNAV1_UNSUPPORTED) {
+    vcnav1_destroy(s->vcn);
+    s->vcn = NULL;
+    return kVTVideoDecoderUnsupportedDataFormatErr;
+  }
 
   CFDictionaryRef attrs =
       vcnav1_copy_pixel_buffer_attributes(s->width, s->height, s->tenBit);
@@ -288,7 +324,7 @@ static void stats_add(Storage* s, double queued, double decode) {
 // the session code) cannot be decoded: refuse it before copying anything.
 enum { kMaxSampleBytes = 0x1800000 };
 
-// Decode one temporal unit and hand the shown frame to VideoToolbox.
+// Decode one temporal unit and hand its shown frame to VideoToolbox.
 static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
                             CMSampleBufferRef sbuf, double enqueued) {
   double started = now_ms();
@@ -308,6 +344,9 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
     ptr = (char*)copy;
   }
   pthread_mutex_lock(&s->lock);
+  int depth = __atomic_load_n(&s->depth, __ATOMIC_RELAXED);
+  if (depth > s->st_depth_max) s->st_depth_max = depth;
+  bool invalidated = s->invalidated;
   if (!status && !s->vcn) status = kVTInvalidSessionErr;
   if (!status &&
       vcnav1_decode(s->vcn, (const uint8_t*)ptr, len, 0, on_output, s)) {
@@ -319,9 +358,16 @@ static void decode_and_emit(Storage* s, VTVideoDecoderFrame frame,
   stats_add(s, started - enqueued, now_ms() - started);
   pthread_mutex_unlock(&s->lock);
   free(copy);
-  if (!status && !out) status = kVTVideoDecoderBadDataErr;
-  VTDecoderSessionEmitDecodedFrame(s->session, frame, status,
-                                   out ? 0 : kVTDecodeInfo_FrameDropped, out);
+  // A sample that failed hands back no picture, even one it showed before. A
+  // temporal unit that shows no frame is emitted as dropped, with no error, as
+  // the VP9 plug-in does with a chunk of hidden frames.
+  if (status && out) {
+    CVPixelBufferRelease(out);
+    out = NULL;
+  }
+  if (!invalidated)
+    VTDecoderSessionEmitDecodedFrame(s->session, frame, status,
+                                     out ? 0 : kVTDecodeInfo_FrameDropped, out);
   if (out) CVPixelBufferRelease(out);
 }
 
@@ -332,23 +378,32 @@ static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
                                  VTDecodeInfoFlags* infoOut) {
   Storage* s = storage_of(dec);
   if (infoOut) *infoOut = 0;
+  if (!sbuf) return kVTParameterErr;
+  if (__atomic_load_n(&s->invalidated, __ATOMIC_RELAXED))
+    return kVTInvalidSessionErr;
   if (!(flags & kVTDecodeFrame_EnableAsynchronousDecompression)) {
     double t = now_ms();
-    dispatch_sync(s->queue, ^{
+    // From inside the output callback the queue is already running this code.
+    if (on_queue(s))
       decode_and_emit(s, frame, sbuf, t);
-    });  // keeps order with queued work
+    else
+      dispatch_sync(s->queue, ^{
+        decode_and_emit(s, frame, sbuf, t);
+      });  // keeps order with queued work
     return noErr;
   }
-  dispatch_semaphore_wait(s->slots, DISPATCH_TIME_FOREVER);
+  // From inside the output callback the running frame still holds its slot,
+  // so waiting for one could wait for ever: queue the frame without one.
+  bool counted = !on_queue(s);
+  if (counted) dispatch_semaphore_wait(s->slots, DISPATCH_TIME_FOREVER);
   CFRetain(sbuf);
   double t = now_ms();
-  int depth = __atomic_add_fetch(&s->depth, 1, __ATOMIC_RELAXED);
-  if (depth > s->st_depth_max) s->st_depth_max = depth;
+  __atomic_add_fetch(&s->depth, 1, __ATOMIC_RELAXED);
   dispatch_async(s->queue, ^{
     decode_and_emit(s, frame, sbuf, t);
     __atomic_sub_fetch(&s->depth, 1, __ATOMIC_RELAXED);
     CFRelease(sbuf);
-    dispatch_semaphore_signal(s->slots);
+    if (counted) dispatch_semaphore_signal(s->slots);
   });
   if (infoOut) *infoOut = kVTDecodeInfo_Asynchronous;
   return noErr;
@@ -356,25 +411,31 @@ static OSStatus dec_decode_frame(VTVideoDecoderRef dec,
 
 static OSStatus dec_copy_supported_properties(VTVideoDecoderRef dec,
                                               CFDictionaryRef* out) {
+  if (!out) return kVTParameterErr;
+  *out = NULL;
   const void* k[] = {kVTPropertyTypeKey, kVTPropertyReadWriteStatusKey};
   const void* v[] = {kVTPropertyType_Boolean,
                      kVTPropertyReadWriteStatus_ReadOnly};
   CFDictionaryRef hw =
       CFDictionaryCreate(NULL, k, v, 2, &kCFTypeDictionaryKeyCallBacks,
                          &kCFTypeDictionaryValueCallBacks);
+  if (!hw) return kVTAllocationFailedErr;
   const void* keys[] = {
       kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder};
   const void* vals[] = {hw};
   *out = CFDictionaryCreate(NULL, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
                             &kCFTypeDictionaryValueCallBacks);
   CFRelease(hw);
-  return noErr;
+  return *out ? noErr : kVTAllocationFailedErr;
 }
 
 static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
                                      CMFormatDescriptionRef fmt) {
   Storage* s = storage_of(dec);
-  if (!s->format) return false;
+  if (!s->format || !fmt ||
+      CMFormatDescriptionGetMediaSubType(fmt) !=
+          CMFormatDescriptionGetMediaSubType(s->format))
+    return false;
   CMVideoDimensions a = CMVideoFormatDescriptionGetDimensions(s->format),
                     b = CMVideoFormatDescriptionGetDimensions(fmt);
   if (a.width != b.width || a.height != b.height) return false;
@@ -387,8 +448,7 @@ static Boolean dec_can_accept_format(VTVideoDecoderRef dec,
 
 static OSStatus dec_finish_delayed_frames(VTVideoDecoderRef dec) {
   Storage* s = storage_of(dec);
-  dispatch_sync(s->queue, ^{
-                });  // every queued frame has been emitted when this returns
+  drain(s);  // every queued frame has been emitted when this returns
   return noErr;
 }
 
@@ -415,6 +475,8 @@ static const VTVideoDecoderVTable kVTable = {NULL, &kBaseClass, &kDecoderClass};
 
 __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
     FourCharCode codec, CFAllocatorRef alloc, VTVideoDecoderRef* out) {
+  if (!out) return kVTParameterErr;
+  *out = NULL;
   if (codec != kCMVideoCodecType_AV1) return kVTCouldNotFindVideoDecoderErr;
   CMBaseObjectRef obj = NULL;
   OSStatus r =
@@ -428,6 +490,11 @@ __attribute__((visibility("default"))) OSStatus AV1VCN_VTDecoder_CreateInstance(
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
                                               QOS_CLASS_USER_INTERACTIVE, 0));
   s->slots = dispatch_semaphore_create(MAX_QUEUED);
+  if (!s->queue || !s->slots) {
+    CFRelease(obj);
+    return kVTAllocationFailedErr;
+  }
+  dispatch_queue_set_specific(s->queue, &kQueueKey, s, NULL);
   *out = (VTVideoDecoderRef)obj;
   return noErr;
 }

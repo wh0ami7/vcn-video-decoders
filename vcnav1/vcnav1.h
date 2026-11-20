@@ -21,7 +21,10 @@ typedef void (*VcnAV1OutputFn)(void* ctx, CVPixelBufferRef frame,
 VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                       size_t errLen);
 void vcnav1_destroy(VcnAV1* d);
-// Feed configuration OBUs (sequence header) e.g. from av1C.
+// Feed configuration OBUs (sequence header) e.g. from av1C. Returns 0, -1 when
+// they cannot be read (or hold a frame), or VCNAV1_UNSUPPORTED when the
+// sequence header asks for what the engine does not decode.
+#define VCNAV1_UNSUPPORTED (-2)
 int vcnav1_configure(VcnAV1* d, const uint8_t* obus, size_t size);
 // Decode one temporal unit. Output frames are reported through fn
 // (synchronously).

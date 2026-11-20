@@ -513,6 +513,9 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   d->frame = calloc(1, FRAME_BYTES);
   d->bsinfo = calloc(1, BSINFO_BYTES);
   if (!d->seq || !d->frame || !d->bsinfo) FAIL("out of memory");
+  // The driver takes width * height * 60 in 32 bits, and not 0.
+  if (!maxWidth || !maxHeight || maxWidth > 8192 || maxHeight > 4352)
+    FAIL("session size %ux%u out of range", maxWidth, maxHeight);
   // No path to the GPU unless asked for: either under the dry run's debugger,
   // which stops the submission, or with the explicit switch. VCNVP9_SESSION=av1
   // pairs an AV1 session with VP9 messages, so it must never run without the
@@ -557,7 +560,7 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   if (r || !d->accel) FAIL("CreateAVDAccelerator %d", r);
   AVD_DriverCreate dc = {.initFlags = 0, .accel = d->accel};
   r = FN(CreateDriver)(&d->drv, &dc);
-  if (r) FAIL("CreateDriver %d", r);
+  if (r || !d->drv) FAIL("CreateDriver %d", r);
   AVD_BitstreamPool pool = {.type = 0,
                             .size = BS_SIZE,
                             .format = 0x72617762,
@@ -567,7 +570,10 @@ VcnVP9* vcnvp9_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                             .eight = 8,
                             .five = 5};
   r = FN(AllocateBitstreamBufferPool)(d->drv, &pool);
-  if (r || !d->bsAddr[0]) FAIL("AllocateBitstreamBufferPool %d", r);
+  if (r) FAIL("AllocateBitstreamBufferPool %d", r);
+  // Frames go to the buffers in turn: every one of them must be there.
+  for (int i = 0; i < NUM_BS; i++)
+    if (!d->bsAddr[i]) FAIL("AllocateBitstreamBufferPool: no buffer %d", i);
   AVD_ContextList list = {0};
   void* ctxOut[2] = {0};
   AVD_FunctionInfo* fis[1] = {&list.inlineInfo};
@@ -681,7 +687,8 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
   const VP9Frame* h = &p->fh;
   if (kind == VP9_PARSE_SHOW_EXISTING) {
     const VP9Ref* r = &p->ref[h->frame_to_show];
-    if (!r->valid || r->dpb_slot < 0 || !d->dpb[r->dpb_slot]) {
+    if (!r->valid || r->dpb_slot < 0 || r->dpb_slot >= NUM_DPB ||
+        !d->dpb[r->dpb_slot]) {
       snprintf(d->err, sizeof(d->err), "show_existing of a missing reference");
       return -1;
     }
@@ -694,12 +701,23 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
              h->profile, h->bit_depth);
     return -1;
   }
+  // Every reference of an inter frame must hold a decoded picture, of the
+  // frame's bit depth: the message sets the depth for the whole DPB, and a
+  // new depth makes the driver allocate it again while the frame reads from it.
   if (h->frame_type && !h->intra_only)
-    for (int i = 0; i < 3; i++)
-      if (!p->ref[h->ref_frame_idx[i]].valid) {
+    for (int i = 0; i < 3; i++) {
+      const VP9Ref* r = &p->ref[h->ref_frame_idx[i]];
+      if (!r->valid || r->dpb_slot < 0 || r->dpb_slot >= NUM_DPB ||
+          !d->dpb[r->dpb_slot]) {
         snprintf(d->err, sizeof(d->err), "missing reference");
         return -1;
       }
+      if (r->bit_depth != h->bit_depth) {
+        snprintf(d->err, sizeof(d->err), "%d-bit reference for a %d-bit frame",
+                 r->bit_depth, h->bit_depth);
+        return -1;
+      }
+    }
   if (h->width > d->maxW || h->height > d->maxH) {
     snprintf(d->err, sizeof(d->err), "%ux%u is over the session maximum",
              h->width, h->height);
@@ -742,6 +760,10 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
   prm.frame = d->frame;
   prm.curr_pic_idx = (uint32_t)slot;
   prm.output = CVPixelBufferGetIOSurface(target);
+  if (!prm.output) {
+    snprintf(d->err, sizeof(d->err), "pixel buffer without an IOSurface");
+    return -1;
+  }
   prm.bsinfo = d->bsinfo;
   prm.vp9 = p;
   for (int i = 0; i < 8; i++)

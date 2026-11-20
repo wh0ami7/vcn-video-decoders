@@ -17,6 +17,13 @@ xcrun clang "${TFLAGS[@]}" -I../vcnav1 -I../vcnvp9 parsedigest.c \
   ../vcnav1/av1parse.c ../vcnvp9/vp9parse.c -o "${B}/parsedigest"
 xcrun clang "${TFLAGS[@]}" -I../vcnav1 av1state.c ../vcnav1/av1parse.c \
   -o "${B}/av1state"
+xcrun clang "${TFLAGS[@]}" -I../vcnvp9 vp9state.c ../vcnvp9/vp9parse.c \
+  -o "${B}/vp9state"
+for c in av1 vp9; do
+  xcrun clang "${TFLAGS[@]}" -DTEST_${(U)c} plugintest.c \
+    -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
+    -framework VideoToolbox -o "${B}/plugintest-${c}"
+done
 xcrun clang "${TFLAGS[@]}" -I../vcncommon acceltest.c ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework IOKit -o "${B}/acceltest"
 echo "built the tests in tests/${B}"

@@ -140,8 +140,7 @@ static void tile_info(BR* b, VP9Frame* h) {
   if (h->log2_tile_rows) h->log2_tile_rows += (int)f(b, 1);
 }
 
-int vp9_parse_frame_header(VP9Parser* p, const uint8_t* data, size_t size) {
-  if (!p) return -1;
+static int parse_header(VP9Parser* p, const uint8_t* data, size_t size) {
   if ((!data && size) || size > SIZE_MAX / 8)
     return fail(p, "invalid input size");
   BR br = {data, size * 8, 0, false}, *b = &br;
@@ -249,9 +248,26 @@ int vp9_parse_frame_header(VP9Parser* p, const uint8_t* data, size_t size) {
   h->uncompressed_header_size = (uint32_t)((b->pos + 7) >> 3);
   if (h->uncompressed_header_size + h->compressed_header_size > size)
     return fail(p, "headers past the frame");
+  // The last tile takes what is left, and it cannot be empty.
+  if (h->uncompressed_header_size + h->compressed_header_size == size)
+    return fail(p, "no tile data");
   h->use_prev_frame_mvs =
       p->have_last && !h->error_res && h->width == p->last_width &&
       h->height == p->last_height && p->last_show_frame && !p->last_intra_only;
+  return 0;
+}
+
+int vp9_parse_frame_header(VP9Parser* p, const uint8_t* data, size_t size) {
+  if (!p) return -1;
+  // The header code updates the state that outlives a frame as it reads (colour
+  // config, loop filter deltas, segmentation). A header that turns out to be
+  // invalid must leave it as it was.
+  VP9Parser saved = *p;
+  if (parse_header(p, data, size)) {
+    memcpy(saved.err, p->err, sizeof(saved.err));
+    *p = saved;
+    return -1;
+  }
   return 0;
 }
 

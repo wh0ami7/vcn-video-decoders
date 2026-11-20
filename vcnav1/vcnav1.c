@@ -171,6 +171,9 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
     return NULL;                                           \
   } while (0)
   if (!d->seq || !d->frame || !d->bsinfo) FAIL("out of memory");
+  // The driver takes width * height * 60 in 32 bits, and not 0.
+  if (!maxWidth || !maxHeight || maxWidth > 8192 || maxHeight > 4352)
+    FAIL("session size %ux%u out of range", maxWidth, maxHeight);
   void* lib = dlopen(AVD_DRIVER_PATH, RTLD_NOW | RTLD_LOCAL);
   if (!lib) FAIL("dlopen driver: %s", dlerror());
   char uuid[33] = "unknown";
@@ -200,7 +203,7 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   if (r || !d->accel) FAIL("CreateAVDAccelerator %d", r);
   AVD_DriverCreate dc = {.initFlags = 0, .accel = d->accel};
   r = FN(CreateDriver)(&d->drv, &dc);
-  if (r) FAIL("CreateDriver %d", r);
+  if (r || !d->drv) FAIL("CreateDriver %d", r);
   AVD_BitstreamPool pool = {.type = 0,
                             .size = BS_SIZE,
                             .format = 0x72617762,
@@ -210,7 +213,10 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
                             .eight = 8,
                             .five = 5};
   r = FN(AllocateBitstreamBufferPool)(d->drv, &pool);
-  if (r || !d->bsAddr[0]) FAIL("AllocateBitstreamBufferPool %d", r);
+  if (r) FAIL("AllocateBitstreamBufferPool %d", r);
+  // Frames go to the buffers in turn: every one of them must be there.
+  for (int i = 0; i < NUM_BS; i++)
+    if (!d->bsAddr[i]) FAIL("AllocateBitstreamBufferPool: no buffer %d", i);
   AVD_ContextList list = {0};
   void* ctxOut[2] = {0};
   AVD_FunctionInfo* fis[1] = {&list.inlineInfo};
@@ -521,6 +527,12 @@ static int submit(VcnAV1* d, AV1Params* prm) {
   return 0;
 }
 
+// What the engine decodes: profile 0, 8 or 10 bits, 4:2:0 in colour.
+static bool seq_supported(const AV1Seq* s) {
+  return s->seq_profile == 0 && (s->BitDepth == 8 || s->BitDepth == 10) &&
+         !s->mono_chrome && s->subsampling_x == 1 && s->subsampling_y == 1;
+}
+
 static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   VcnAV1* d = vctx;
   const AV1Frame* h = &p->fh;
@@ -537,6 +549,14 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
       release_slot_refs(d);
     }
     return 0;
+  }
+  // A sequence header inside the stream can ask for more than av1C said.
+  if (!seq_supported(&p->seq)) {
+    snprintf(d->err, sizeof(d->err),
+             "profile %d, %d bits, mono %d, subsampling %d%d not supported",
+             p->seq.seq_profile, p->seq.BitDepth, p->seq.mono_chrome,
+             p->seq.subsampling_x, p->seq.subsampling_y);
+    return -1;
   }
   if (timing < 0) timing = getenv("VCNAV1_TIMING") != NULL;
   double tf0 = timing ? tnow_ms() : 0;
@@ -558,6 +578,18 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
              hh);
     return -1;
   }
+  // Refuse what does not fit before a DPB slot or bitstream buffer is taken.
+  if (p->tile_data_size > BS_SIZE - 256) {
+    snprintf(d->err, sizeof(d->err), "frame too big");
+    return -1;
+  }
+  for (int i = 0; i < p->num_tiles; i++) {
+    const AV1Tile* t = &p->tiles[i];
+    if (t->row < 0 || t->row >= 64 || t->col < 0 || t->col >= 64) {
+      snprintf(d->err, sizeof(d->err), "tile index out of range");
+      return -1;
+    }
+  }
   int slot = alloc_dpb_slot(d);
   if (slot < 0) {
     snprintf(d->err, sizeof(d->err), "no free DPB slot");
@@ -576,10 +608,6 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   // bitstream: concatenated tile data
   int bi = d->bsNext;
   d->bsNext = (d->bsNext + 1) % NUM_BS;
-  if (p->tile_data_size > BS_SIZE - 256) {
-    snprintf(d->err, sizeof(d->err), "frame too big");
-    return -1;
-  }
   memcpy(d->bsAddr[bi], p->tile_data, p->tile_data_size);
   memset((uint8_t*)d->bsAddr[bi] + p->tile_data_size, 0, 256);
   memset(d->bsinfo, 0, BSINFO_BYTES);
@@ -587,10 +615,6 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   *(uint32_t*)(d->bsinfo + 16) = (uint32_t)((p->tile_data_size + 127) & ~127u);
   for (int i = 0; i < p->num_tiles; i++) {
     const AV1Tile* t = &p->tiles[i];
-    if (t->row < 0 || t->row >= 64 || t->col < 0 || t->col >= 64) {
-      snprintf(d->err, sizeof(d->err), "tile index out of range");
-      return -1;
-    }
     uint32_t* e = (uint32_t*)(d->bsinfo + 20 + 512 * t->row + 8 * t->col);
     e[0] = t->offset;
     e[1] = t->size;
@@ -601,8 +625,16 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   prm.frame = d->frame;
   prm.curr_pic_idx = slot;
   prm.output = CVPixelBufferGetIOSurface(d->dpb[slot]);
+  if (!prm.output) {
+    snprintf(d->err, sizeof(d->err), "pixel buffer without an IOSurface");
+    return -1;
+  }
+  // A reference slot the header emptied keeps its old DPB index, which may be
+  // the slot this frame is decoded into: give the driver no index for it.
   for (int i = 0; i < 8; i++)
-    prm.ref_frame_map[i] = p->ref[i].dpb_slot >= 0 ? p->ref[i].dpb_slot : 0x7f;
+    prm.ref_frame_map[i] = p->ref[i].valid && p->ref[i].dpb_slot >= 0
+                               ? (uint32_t)p->ref[i].dpb_slot
+                               : 0x7f;
   for (int i = 0; i < 7; i++) {
     int s = h->FrameIsIntra ? -1 : p->ref[h->ref_frame_idx[i]].dpb_slot;
     prm.frame_refs[i] = s >= 0 ? s : 0x7f;
@@ -625,8 +657,29 @@ static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   return 0;
 }
 
+// configOBUs hold the sequence header and metadata only, never a frame.
+static int config_no_frames(void* vctx, AV1Parser* p, AV1ParseResult kind) {
+  (void)p;
+  (void)kind;
+  VcnAV1* d = vctx;
+  snprintf(d->err, sizeof(d->err), "a frame in the configOBUs");
+  return -1;
+}
+
 int vcnav1_configure(VcnAV1* d, const uint8_t* obus, size_t size) {
-  return av1_parse_temporal_unit(&d->parser, obus, size, on_frame, d);
+  d->err[0] = 0;
+  if (av1_parse_temporal_unit(&d->parser, obus, size, config_no_frames, d)) {
+    if (!d->err[0]) snprintf(d->err, sizeof(d->err), "unreadable configOBUs");
+    return -1;
+  }
+  if (d->parser.seq.valid && !seq_supported(&d->parser.seq)) {
+    snprintf(d->err, sizeof(d->err),
+             "sequence header: profile %d, %d bits, mono %d not supported",
+             d->parser.seq.seq_profile, d->parser.seq.BitDepth,
+             d->parser.seq.mono_chrome);
+    return VCNAV1_UNSUPPORTED;
+  }
+  return 0;
 }
 
 int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,

@@ -17,11 +17,13 @@ cd "${0:A:h}"
 rounds=300
 [[ ${1:-} == --quick ]] && rounds=30
 failed=()
+passed=0
 check() {  # check <name> <command...>
   local name=$1
   shift
   if "$@"; then
     echo "PASS ${name}"
+    passed=$((passed + 1))
   else
     echo "FAIL ${name}"
     failed+=("${name}")
@@ -50,10 +52,24 @@ av1state() {
     { cat "${B}/av1state.txt"; return 1; }
 }
 check "a refused AV1 sample leaves the parser consistent" av1state
+vp9state() {
+  "${B}/vp9state" media/vp9/vp90-2-05-resize.ivf > "${B}/vp9state.txt" ||
+    { cat "${B}/vp9state.txt"; return 1; }
+}
+check "a refused VP9 header leaves the parser consistent" vp9state
+plugins() {
+  local c
+  for c in av1 vp9; do
+    "${B}/plugintest-${c}" > "${B}/plugintest-${c}.txt" ||
+      { cat "${B}/plugintest-${c}.txt"; return 1; }
+  done
+}
+check "the plug-ins' VideoToolbox side, with a stand-in decoder" plugins
+
 check "only AMD's accelerator is taken" "${B}/acceltest"
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"
   exit 1
 fi
-echo "all tests passed"
+echo "all ${passed} tests passed"
