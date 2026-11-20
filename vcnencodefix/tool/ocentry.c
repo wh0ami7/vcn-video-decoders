@@ -55,7 +55,11 @@ static int read_file(const char* path, Buf* b) {
 
 static int write_file(const char* path, const void* p, size_t n) {
   char tmp[1100];
-  snprintf(tmp, sizeof(tmp), "%s.%s-tmp", path, K->tag);
+  int tn = snprintf(tmp, sizeof(tmp), "%s.%s-tmp", path, K->tag);
+  if (tn < 0 || (size_t)tn >= sizeof(tmp)) {
+    fprintf(stderr, "%s: path too long\n", path);
+    return -1;
+  }
   FILE* f = fopen(tmp, "wb");
   if (!f) {
     perror(tmp);
@@ -453,6 +457,12 @@ static int backup(const char* path, const Buf* orig, char* out, size_t outLen) {
   char ts[32];
   time_t t = time(NULL);
   strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", localtime(&t));
+  // room for the longest name below: ".backup-" ts "-99" "-pre-" tag
+  if (strlen(path) + strlen(".backup--99-pre-") + strlen(ts) + strlen(K->tag) >=
+      outLen) {
+    fprintf(stderr, "%s: path too long\n", path);
+    return -1;
+  }
   snprintf(out, outLen, "%s.backup-%s-pre-%s", path, ts, K->tag);
   for (int i = 2; access(out, F_OK) == 0 && i < 100; i++)
     snprintf(out, outLen, "%s.backup-%s-%d-pre-%s", path, ts, i, K->tag);

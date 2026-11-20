@@ -35,7 +35,8 @@ $tool efi-add c.plist 2>&1 | grep -q "nothing to change" && ok "other Comment is
 
 # 4. empty Kernel > Add (<array/>) falls back to CoreFoundation and is still verified
 perl -0pe 's{(<key>Kernel</key>\s*<dict>\s*<key>Add</key>\s*)<array>.*?</array>}{$1<array/>}s' $sample > e.plist
-$tool efi-add e.plist > out4 2>&1; grep -q "Lilu.kext is not enabled" out4 && ok "empty Add without Lilu is refused" || bad "empty Add: $(cat out4)"
+$tool efi-add e.plist > out4 2>&1; rc=$?
+(( rc != 0 )) && grep -q "Lilu.kext is not enabled" out4 && ok "empty Add without Lilu is refused" || bad "empty Add (exit $rc): $(cat out4)"
 
 # 5. Lilu disabled is refused, file untouched
 perl -0pe 's{(<string>Lilu.kext</string>.*?<key>Enabled</key>\s*)<true/>}{$1<false/>}s' $sample > l.plist; cp l.plist l.orig
@@ -70,7 +71,9 @@ $tool efi-add o.plist 2>&1 | grep -q "nothing to change" && ok "add after update
 # 11. an old entry that also differs elsewhere (disabled) is still refused, file untouched
 cp o.orig x.plist
 perl -0pi -e 's{(<string>VCNEncodeFloor.kext</string>.*?<key>Enabled</key>\s*)<true/>}{$1<false/>}s' x.plist; cp x.plist x.orig
-$tool efi-add x.plist > /dev/null 2>&1; [[ $? -ne 0 ]] && cmp -s x.plist x.orig && ok "old disabled entry is refused, file untouched" || bad "old disabled entry"
+# exit status 3 = listed but different, which a caller can tell apart from other errors
+$tool efi-add x.plist > /dev/null 2>&1; rc=$?
+(( rc == 3 )) && cmp -s x.plist x.orig && ok "old disabled entry is refused (3), file untouched" || bad "old disabled entry (exit $rc)"
 
 cd /; rm -rf -- "$T"
 print "efi tests: $pass passed, $fail failed"

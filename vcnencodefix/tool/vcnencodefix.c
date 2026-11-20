@@ -116,7 +116,8 @@ static void logReopen(void) {
   fflush(stdout);
   dup2(fd, STDOUT_FILENO);
   dup2(fd, STDERR_FILENO);
-  close(fd);
+  // open() returns 1 or 2 when that descriptor was closed: keep it then
+  if (fd != STDOUT_FILENO && fd != STDERR_FILENO) close(fd);
 }
 
 static void logFollow(void) {
@@ -316,7 +317,8 @@ static void locate_wide(void) {
     uint64_t caveVm =
         sizeof(*mh) + mh->sizeofcmds;  // __TEXT starts at file offset 0 /
                                        // vmaddr 0 in this image
-    bool caveZero = caveVm + kWideCaveLen <= text->addr;
+    bool caveZero = caveVm + kWideCaveLen <= text->addr &&
+                    caveVm + kWideCaveLen <= (uint64_t)st.st_size;
     for (uint64_t i = 0; caveZero && i < kWideCaveLen; i++)
       caveZero = ((const uint8_t*)map)[caveVm + i] == 0;
     if (m != 1)
@@ -592,13 +594,23 @@ static void os_line(char* buf, size_t len) {
   snprintf(buf, len, "macOS %s (%s)", ver, build);
 }
 
+// A whole decimal number, nothing else in the string.
+static bool parse_long(const char* s, long* out) {
+  char* end;
+  errno = 0;
+  long v = strtol(s, &end, 10);
+  if (errno != 0 || end == s || *end != 0) return false;
+  *out = v;
+  return true;
+}
+
+// The encoder service processes; NULL with *count 0 when listing fails.
 static pid_t* list_services(int* count) {
+  *count = 0;
   int n = proc_listallpids(NULL, 0);
+  if (n < 0) return NULL;
   pid_t* pids = calloc((size_t)n + 256, sizeof(pid_t));
-  if (!pids) {
-    *count = 0;
-    return NULL;
-  }
+  if (!pids) return NULL;
   n = proc_listallpids(pids, (n + 256) * (int)sizeof(pid_t));
   int k = 0;
   for (int i = 0; i < n; i++)
@@ -973,15 +985,12 @@ int main(int argc, char** argv) {
       usage();
       return 2;
     }
-    {
-      char* end = NULL;
-      long v = strtol(argv[2], &end, 10);
-      if (!end || end == argv[2] || *end || v <= 0 || v > 0x7fffffff) {
-        fprintf(stderr, "bad pid\n");
-        return 2;
-      }
-      pid = (pid_t)v;
+    long v;
+    if (!parse_long(argv[2], &v) || v <= 0 || v > INT32_MAX) {
+      usage();
+      return 2;
     }
+    pid = (pid_t)v;
     argi = 3;
   } else if (strcmp(cmd, "status") && strcmp(cmd, "watch")) {
     usage();
@@ -998,18 +1007,12 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-wide"))
       wide = false;
     else if (!strcmp(argv[i], "--interval") && i + 1 < argc) {
-      {
-        char* end = NULL;
-        const char* s = argv[++i];
-        long v = strtol(s, &end, 10);
-        if (!end || end == s || *end || v < 0 || v > 3600000) {
-          fprintf(stderr, "bad --interval\n");
-          return 2;
-        }
-        interval = (unsigned)v;
-        if (interval < 20) interval = 20;
-        if (interval > 60000) interval = 60000;
+      long v;
+      if (!parse_long(argv[++i], &v)) {
+        usage();
+        return 2;
       }
+      interval = v < 20 ? 20 : v > 60000 ? 60000 : (unsigned)v;
     } else {
       usage();
       return 2;

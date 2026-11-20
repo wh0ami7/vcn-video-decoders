@@ -2,6 +2,13 @@
 
 ## 1.2.3 (not released)
 
+- Kext: the log of the first 32 floored requests now takes its slot atomically, so two encode sessions at once
+  cannot go past the cap.
+- Tool: `patch <pid>` and `--interval` refuse anything that is not a whole number (atoi read `abc` as 0). The
+  pid list survives a failed allocation, the log reopen keeps standard output when `open()` returns 1 or 2, and
+  the free space checked for the wide patch must also be inside the file.
+- config.plist editing (`efi`): every allocation is checked, and a path too long for the temporary or backup
+  name stops with an error instead of using a cut name.
 - watch: an encoder service macOS refuses access to (SIP Debugging Restrictions on) was asked again on every
   full scan, four times a second, with one log line each time, for as long as it ran. It is now logged once and
   remembered like a patched service. A failed allocation of the pid lists no longer leaves a NULL list in use,

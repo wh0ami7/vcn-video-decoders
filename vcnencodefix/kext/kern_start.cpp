@@ -174,12 +174,17 @@ static int64_t floorPMRequest(t_pmRequest org, void* pem, uint8_t* in,
       memcpy(copy, in, sizeof(copy));
       wr32(copy + kOffVclkFloor, gFloor);
       int64_t result = org(pem, copy, out);
-      if (gLogs < kMaxLogs) {
+      // Several encode sessions can get here at once: a log slot is taken
+      // atomically so the cap holds.
+      int n = __atomic_load_n(&gLogs, __ATOMIC_RELAXED);
+      while (n < kMaxLogs &&
+             !__atomic_compare_exchange_n(&gLogs, &n, n + 1, true,
+                                          __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      }
+      if (n < kMaxLogs)
         SYSLOG("vcnfloor",
                "client type %u minMclk %u: VclkFloor 0 -> %u, result %lld",
                type, minMclk, gFloor, result);
-        gLogs++;
-      }
       return result;
     }
   }

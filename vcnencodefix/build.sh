@@ -56,22 +56,27 @@ xcrun clang -arch x86_64 -mmacosx-version-min=14.0 $B/obj/vtenc.o $B/obj/gpusrc.
 codesign -f -s - -i com.droga.vtenc $B/vtenc 2>/dev/null
 
 print "== tests"
-xcrun clang -arch x86_64 -O1 -Wall -Wextra -Werror tests/wide_test.c tests/run_block.s tool/patches.c -o $B/obj/wide_test
+xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+  tests/wide_test.c tests/run_block.s tool/patches.c -o $B/obj/wide_test
 $B/obj/wide_test | tail -1
 if [[ -f $OC_SAMPLE ]]; then zsh tests/efi_test.sh ${B:A}/vcnencodefix $OC_SAMPLE | tail -1
 else print "skipping EFI tests: no OpenCore Sample.plist at $OC_SAMPLE"; fi
 $B/vcnencodefix status > /dev/null && print "status: both patches located on this system" || print "status: not every patch is available here"
 
 print "== package"
-P=dist/VCNEncodeFix-$VERSION
-rm -rf $P dist/VCNEncodeFix-$VERSION.zip && mkdir -p $P/bin $P/Kexts $P/support
+# assembled under another name; it replaces the old package only when everything worked
+FINALP=dist/VCNEncodeFix-$VERSION
+P=dist/.VCNEncodeFix-$VERSION.new
+rm -rf $P && mkdir -p $P/bin $P/Kexts $P/support
 cp README.md CHANGELOG.md VERSION $P/
 cp scripts/install.sh scripts/uninstall.sh scripts/doctor.sh scripts/test.sh $P/
 chmod 755 $P/*.sh
 cp $B/vcnencodefix $B/vtenc $P/bin/
 ditto --norsrc --noextattr $KX $P/Kexts/VCNEncodeFloor.kext
 cp launchd/com.droga.vcnencodefix.plist newsyslog/vcnencodefix.conf $P/support/
-(cd $P && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS)
+(cd $P && find . -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs shasum -a 256 > SHA256SUMS)
 xattr -cr $P
+rm -rf $FINALP dist/VCNEncodeFix-$VERSION.zip
+mv $P $FINALP
 (cd dist && ditto -c -k --norsrc --noextattr --keepParent VCNEncodeFix-$VERSION VCNEncodeFix-$VERSION.zip)
-print "built $P and dist/VCNEncodeFix-$VERSION.zip ($(du -h dist/VCNEncodeFix-$VERSION.zip | cut -f1))"
+print "built $FINALP and dist/VCNEncodeFix-$VERSION.zip ($(du -h dist/VCNEncodeFix-$VERSION.zip | cut -f1))"
