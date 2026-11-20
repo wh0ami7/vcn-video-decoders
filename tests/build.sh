@@ -15,4 +15,6 @@ TFLAGS=(-arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-function
   -fno-sanitize-recover=undefined)
 xcrun clang "${TFLAGS[@]}" -I../vcnav1 -I../vcnvp9 parsedigest.c \
   ../vcnav1/av1parse.c ../vcnvp9/vp9parse.c -o "${B}/parsedigest"
+xcrun clang "${TFLAGS[@]}" -I../vcncommon acceltest.c ../vcncommon/vcndriver.c \
+  -framework CoreFoundation -framework IOKit -o "${B}/acceltest"
 echo "built the tests in tests/${B}"

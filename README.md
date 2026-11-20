@@ -74,7 +74,8 @@ Details, limits and the command-line install are in `vcnencodefix/README.md`. Ve
 
 | Folder | What it is |
 |---|---|
-| `vcnav1/` | AV1 core: bitstream parser, driver interface (`avd.h`), VCN submission. `decode_ivf` test tool |
+| `vcnav1/` | AV1 core: bitstream parser, VCN submission. `decode_ivf` test tool |
+| `vcncommon/` | What both cores share: the driver interface (`avd.h`), the accelerator lookup and the driver build check (`vcndriver.c`) |
 | `vcnvp9/` | VP9 core: parser, VCN messages, IVF/WebM readers. `decode_vp9` test tool |
 | `vtav1/` | `AV1VCNDecoder.bundle`, the VideoToolbox plug-in for `av01`. `vtav1test` drives it through the public VT API |
 | `vtvp9/` | `VP9VCNDecoder.bundle`, the VideoToolbox plug-in for `vp09`. `vtvp9test` drives it through the public VT API |

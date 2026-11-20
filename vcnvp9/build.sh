@@ -10,7 +10,10 @@ CFLAGS=(
   -fno-strict-overflow
 )
 clang "${CFLAGS[@]}" vp9parse.c vp9dump.c -o vp9dump
-clang "${CFLAGS[@]}" vp9parse.c vcnvp9.c decode_vp9.c -o decode_vp9 \
+# -DVCN_DRYRUN_TOOLS adds the memory dump helper tools/dryrun_vp9.py calls; the
+# plug-in is built without it.
+clang "${CFLAGS[@]}" -DVCN_DRYRUN_TOOLS -I../vcncommon vp9parse.c vcnvp9.c \
+  ../vcncommon/vcndriver.c decode_vp9.c -o decode_vp9 \
   -framework CoreFoundation -framework CoreGraphics -framework CoreVideo \
   -framework ImageIO -framework IOKit -framework IOSurface
 echo built

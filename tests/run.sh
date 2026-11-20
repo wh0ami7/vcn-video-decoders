@@ -46,6 +46,8 @@ damaged() {
 }
 check "${rounds} damaged copies of each stream are survived" damaged
 
+check "only AMD's accelerator is taken" "${B}/acceltest"
+
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"
   exit 1

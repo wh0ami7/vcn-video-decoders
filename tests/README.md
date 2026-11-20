@@ -14,3 +14,4 @@ programs are built with the address and undefined-behaviour sanitizers.
 | Program | What it checks |
 |---|---|
 | `parsedigest` | The AV1 and VP9 header parsers read every stream exactly as recorded in `expected-digests.txt`, survive libvpx's invalid streams, and survive thousands of copies damaged at random (`--mutate`) |
+| `acceltest` | The rule that picks the accelerator handed to AMD's driver (only a codec whose name starts with "AMD"), then lists this machine's `IOAccelerator` services and says which one the decoders take. Read-only |

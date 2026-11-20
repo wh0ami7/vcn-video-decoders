@@ -4,8 +4,6 @@
 #include <CoreVideo/CoreVideo.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -14,6 +12,7 @@
 #include <unistd.h>
 
 #include "avd.h"
+#include "vcndriver.h"
 
 int vcnav1_debug = 0;
 int vcnav1_gpu_armed = 0;
@@ -77,26 +76,6 @@ struct VcnAV1 {
   bool poolTen;
 };
 
-static io_service_t find_accelerator(void) {
-  io_iterator_t it;
-  if (IOServiceGetMatchingServices(kIOMainPortDefault,
-                                   IOServiceMatching("IOAccelerator"), &it))
-    return 0;
-  io_service_t s, found = 0;
-  while ((s = IOIteratorNext(it))) {
-    CFTypeRef codec =
-        IORegistryEntryCreateCFProperty(s, CFSTR("IOGVACodec"), NULL, 0);
-    if (codec) {
-      CFRelease(codec);
-      found = s;
-      break;
-    }
-    IOObjectRelease(s);
-  }
-  IOObjectRelease(it);
-  return found;
-}
-
 #define FN(name) ((AVD_##name##_fn)d->accel->fn[AVD_FN_##name])
 
 // The parameter layouts were recovered from (and validated on the GPU against)
@@ -112,23 +91,6 @@ static const char* const kValidatedDrivers[] = {
                                          // (25G342, same binary): compared in
                                          // IDA against 26.7.1, same code
 };
-
-static bool driver_uuid(char out[33]) {
-  for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-    if (!strstr(_dyld_get_image_name(i), "AMDRadeonVADriver2")) continue;
-    const struct mach_header_64* h = (const void*)_dyld_get_image_header(i);
-    const struct load_command* lc = (const void*)(h + 1);
-    for (uint32_t k = 0; k < h->ncmds;
-         k++, lc = (const void*)((const char*)lc + lc->cmdsize))
-      if (lc->cmd == LC_UUID) {
-        for (int j = 0; j < 16; j++)
-          snprintf(out + 2 * j, 3, "%02X",
-                   ((const struct uuid_command*)lc)->uuid[j]);
-        return true;
-      }
-  }
-  return false;
-}
 
 static CFNumberRef cfnum(long long v) {
   return CFNumberCreate(NULL, kCFNumberLongLongType, &v);
@@ -212,7 +174,7 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   if (!lib) FAIL("dlopen driver: %s", dlerror());
   char uuid[33] = "unknown";
   bool validated = false;
-  driver_uuid(uuid);
+  vcn_driver_uuid(uuid);
   for (size_t i = 0; i < sizeof(kValidatedDrivers) / sizeof(*kValidatedDrivers);
        i++)
     if (!strcmp(uuid, kValidatedDrivers[i])) validated = true;
@@ -226,7 +188,7 @@ VcnAV1* vcnav1_create(uint32_t maxWidth, uint32_t maxHeight, char* err,
   AVD_CreateAVDAccelerator_fn create =
       (AVD_CreateAVDAccelerator_fn)dlsym(lib, "AVD_CreateAVDAccelerator");
   if (!create) FAIL("no AVD_CreateAVDAccelerator");
-  io_service_t svc = find_accelerator();
+  io_service_t svc = vcn_find_accelerator();
   if (!svc) FAIL("no AMD accelerator");
   uint32_t services[8] = {svc};
   AVD_AcceleratorCreate ac = {
@@ -654,6 +616,7 @@ int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,
   return r;
 }
 
+#ifdef VCN_DRYRUN_TOOLS
 void vcnav1_flush(VcnAV1* d) {
   for (int i = 0; i < 8; i++) {
     d->parser.ref[i].valid = 0;
@@ -665,7 +628,7 @@ void vcnav1_flush(VcnAV1* d) {
 // inside the process.
 __attribute__((noinline, used)) int vcnav1_dump(const void* p, long n,
                                                 const char* path) {
-  // Dry-run only: refuse odd sizes and path characters that break C exprs.
+  // Refuse odd sizes and anything but plain path characters.
   if (!p || !path || n <= 0 || n > 64 * 1024 * 1024) return -1;
   for (const unsigned char* c = (const unsigned char*)path; *c; c++) {
     if (*c < 0x20 || *c == 0x7f) return -1;
@@ -681,3 +644,4 @@ __attribute__((noinline, used)) int vcnav1_dump(const void* p, long n,
   fclose(f);
   return (int)w;
 }
+#endif  // VCN_DRYRUN_TOOLS

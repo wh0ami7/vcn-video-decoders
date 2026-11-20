@@ -14,7 +14,8 @@ clang -arch x86_64 -O2 -g -bundle -fvisibility=hidden -Wall -Wextra -Wno-unused-
   -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security \
   -fno-strict-overflow \
   -Wno-four-char-constants -Wno-deprecated-declarations -mmacosx-version-min=13.0 \
-  VP9VCNDecoder.c ../vcnvp9/vcnvp9.c ../vcnvp9/vp9parse.c \
+  -I../vcncommon VP9VCNDecoder.c ../vcnvp9/vcnvp9.c ../vcnvp9/vp9parse.c \
+  ../vcncommon/vcndriver.c \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
   -framework VideoToolbox -framework IOKit -framework IOSurface \
   -o "${B}/Contents/MacOS/VP9VCNDecoder"

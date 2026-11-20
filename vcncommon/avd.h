@@ -3,8 +3,8 @@
 // Hex-Rays output and live lldb traces of VTDecoderXPCService decoding HEVC.
 // Only the fields we need are named.
 
-#ifndef VCNAV1_AVD_H_
-#define VCNAV1_AVD_H_
+#ifndef VCNCOMMON_AVD_H_
+#define VCNCOMMON_AVD_H_
 
 #include <IOKit/IOKitLib.h>
 #include <stdint.h>
@@ -148,4 +148,4 @@ typedef int (*AVD_ScheduleAVDCommands_fn)(void* driver, AVD_CmdList* cmds,
 typedef int (*AVD_QueryAVDCommandStatus_fn)(void* driver, void* query);
 typedef int (*AVD_DeleteDriver_fn)(void* driver);
 
-#endif  // VCNAV1_AVD_H_
+#endif  // VCNCOMMON_AVD_H_
