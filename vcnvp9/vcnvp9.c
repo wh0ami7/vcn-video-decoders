@@ -445,6 +445,14 @@ static void* hook_create_processor(void* factory, int type, void* decoder) {
 static CFNumberRef cfnum(long long v) {
   return CFNumberCreate(NULL, kCFNumberLongLongType, &v);
 }
+// Sets one number; false when it could not be made (out of memory).
+static bool put_num(CFMutableDictionaryRef a, CFStringRef k, long long v) {
+  CFNumberRef n = cfnum(v);
+  if (!n) return false;
+  CFDictionarySetValue(a, k, n);
+  CFRelease(n);
+  return true;
+}
 CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
                                                     bool ten) {
   CFMutableDictionaryRef a =
@@ -453,8 +461,15 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
   CFMutableDictionaryRef io =
       CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
                                 &kCFTypeDictionaryValueCallBacks);
-  CFNumberRef n;
-#define PUT(k, v) (n = cfnum(v), CFDictionarySetValue(a, k, n), CFRelease(n))
+  // NULL when anything cannot be made: half a set of attributes would give
+  // surfaces with a layout the engine was never checked with.
+  if (!a || !io) {
+    if (a) CFRelease(a);
+    if (io) CFRelease(io);
+    return NULL;
+  }
+  bool ok = true;
+#define PUT(k, v) (ok = put_num(a, k, v) && ok)
   PUT(kCVPixelBufferPixelFormatTypeKey,
       ten ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
           : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
@@ -467,6 +482,10 @@ CFDictionaryRef vcnvp9_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
   CFDictionarySetValue(a, kCVPixelBufferIOSurfacePropertiesKey, io);
   CFDictionarySetValue(a, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
   CFRelease(io);
+  if (!ok) {
+    CFRelease(a);
+    return NULL;
+  }
   return a;
 }
 
@@ -478,6 +497,7 @@ static CVPixelBufferRef new_target(VcnVP9* d, uint32_t w, uint32_t h,
   }
   if (!d->pool) {
     CFDictionaryRef a = vcnvp9_copy_pixel_buffer_attributes(w, h, ten);
+    if (!a) return NULL;
     CVReturn r = CVPixelBufferPoolCreate(NULL, NULL, a, &d->pool);
     CFRelease(a);
     if (r) {

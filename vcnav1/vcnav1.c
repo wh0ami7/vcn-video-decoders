@@ -96,6 +96,14 @@ static const char* const kValidatedDrivers[] = {
 static CFNumberRef cfnum(long long v) {
   return CFNumberCreate(NULL, kCFNumberLongLongType, &v);
 }
+// Sets one number; false when it could not be made (out of memory).
+static bool put_num(CFMutableDictionaryRef a, CFStringRef k, long long v) {
+  CFNumberRef n = cfnum(v);
+  if (!n) return false;
+  CFDictionarySetValue(a, k, n);
+  CFRelease(n);
+  return true;
+}
 // Pixel buffer attributes whose IOSurfaces have the layout validated on the
 // VCN: pitch aligned to 256, height padded to 64, UV plane offset aligned to
 // 4096.
@@ -107,8 +115,15 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
   CFMutableDictionaryRef io =
       CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
                                 &kCFTypeDictionaryValueCallBacks);
-  CFNumberRef n;
-#define PUT(k, v) (n = cfnum(v), CFDictionarySetValue(a, k, n), CFRelease(n))
+  // NULL when anything cannot be made: half a set of attributes would give
+  // surfaces with a layout the engine was never checked with.
+  if (!a || !io) {
+    if (a) CFRelease(a);
+    if (io) CFRelease(io);
+    return NULL;
+  }
+  bool ok = true;
+#define PUT(k, v) (ok = put_num(a, k, v) && ok)
   PUT(kCVPixelBufferPixelFormatTypeKey,
       tenBit ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
              : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
@@ -127,6 +142,10 @@ CFDictionaryRef vcnav1_copy_pixel_buffer_attributes(uint32_t w, uint32_t h,
   CFDictionarySetValue(a, kCVPixelBufferIOSurfacePropertiesKey, io);
   CFDictionarySetValue(a, kCVPixelBufferMetalCompatibilityKey, kCFBooleanTrue);
   CFRelease(io);
+  if (!ok) {
+    CFRelease(a);
+    return NULL;
+  }
   return a;
 }
 static CVPixelBufferRef new_target(VcnAV1* d, uint32_t w, uint32_t h,
@@ -137,6 +156,7 @@ static CVPixelBufferRef new_target(VcnAV1* d, uint32_t w, uint32_t h,
   }
   if (!d->pool) {
     CFDictionaryRef attrs = vcnav1_copy_pixel_buffer_attributes(w, h, tenBit);
+    if (!attrs) return NULL;
     CVReturn r = CVPixelBufferPoolCreate(NULL, NULL, attrs, &d->pool);
     CFRelease(attrs);
     if (r) {

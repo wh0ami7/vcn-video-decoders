@@ -249,6 +249,11 @@ static OSStatus dec_start_session(VTVideoDecoderRef dec,
   }
   CFDictionaryRef attrs =
       vcnvp9_copy_pixel_buffer_attributes(s->width, s->height, s->tenBit);
+  if (!attrs) {  // out of memory: no session rather than one with no attributes
+    vcnvp9_destroy(s->vcn);
+    s->vcn = NULL;
+    return kVTAllocationFailedErr;
+  }
   VTDecoderSessionSetPixelBufferAttributes(session, attrs);
   CFRelease(attrs);
   os_log(logger(), "session %dx%d %{public}s", s->width, s->height,
