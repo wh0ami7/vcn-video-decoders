@@ -324,8 +324,8 @@ int vp9_parse_chunk(VP9Parser* p, const uint8_t* data, size_t size,
         sizes[i] = s;
         total += s;
       }
-      if (total != size - index)
-        return fail(p, "superframe sizes do not match the chunk");
+      if (total > size - index)
+        return fail(p, "superframe sizes past the chunk");
       count = (size_t)frames;
     }
   }

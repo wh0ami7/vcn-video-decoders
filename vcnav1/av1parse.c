@@ -1352,7 +1352,7 @@ int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
   size_t off = 0;
   while (off < size) {
     uint8_t hdr = data[off];
-    if (hdr & 0x81) return -1;
+    if (hdr & 0x80) return -1;  // obu_forbidden_bit
     int obu_type = (hdr >> 3) & 15;
     int obu_extension_flag = (hdr >> 2) & 1;
     int obu_has_size_field = (hdr >> 1) & 1;
@@ -1360,7 +1360,6 @@ int av1_parse_temporal_unit(AV1Parser* p, const uint8_t* data, size_t size,
     p->temporal_id = p->spatial_id = 0;
     if (obu_extension_flag) {
       if (off + 1 >= size) return -1;
-      if (data[off + 1] & 7) return -1;
       p->temporal_id = (data[off + 1] >> 5) & 7;
       p->spatial_id = (data[off + 1] >> 3) & 3;
       hlen = 2;
