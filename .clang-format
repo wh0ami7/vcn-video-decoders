@@ -24,6 +24,16 @@ IncludeCategories:
     Priority: 2
     SortPriority: 2
 ---
+# Objective-C, and C headers that clang-format reads as Objective-C because
+# they declare blocks (vcncommon/vcndriver.h).
+Language: ObjC
+BasedOnStyle: Google
+ColumnLimit: 80
+IndentWidth: 2
+UseTab: Never
+DerivePointerAlignment: false
+PointerAlignment: Left
+---
 Language: JavaScript
 BasedOnStyle: Google
 ColumnLimit: 80
