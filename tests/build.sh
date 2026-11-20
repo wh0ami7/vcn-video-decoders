@@ -19,6 +19,7 @@ xcrun clang "${TFLAGS[@]}" -I../vcnav1 av1state.c ../vcnav1/av1parse.c \
   -o "${B}/av1state"
 xcrun clang "${TFLAGS[@]}" -I../vcnvp9 vp9state.c ../vcnvp9/vp9parse.c \
   -o "${B}/vp9state"
+# The plug-ins' VideoToolbox side, with a stand-in for the decoder session.
 for c in av1 vp9; do
   xcrun clang "${TFLAGS[@]}" -DTEST_${(U)c} plugintest.c \
     -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
@@ -29,6 +30,7 @@ xcrun clang "${TFLAGS[@]}" -I../vcncommon acceltest.c ../vcncommon/vcndriver.c \
 xcrun clang "${TFLAGS[@]}" -I../vcncommon waittest.c ../vcncommon/vcnsession.c \
   -framework CoreFoundation -framework IOKit -o "${B}/waittest"
 # The decoder sessions against a made-up driver: sessiontest.c stands in for
+# vcncommon/vcndriver.c.
 for c in av1 vp9; do
   xcrun clang "${TFLAGS[@]}" -DTEST_${(U)c} -I../vcncommon -I../vcn${c} \
     sessiontest.c ../vcn${c}/vcn${c}.c ../vcn${c}/${c}parse.c \

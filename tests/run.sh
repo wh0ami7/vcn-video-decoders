@@ -47,6 +47,7 @@ damaged() {
     > "${B}/damaged.txt"
 }
 check "${rounds} damaged copies of each stream are survived" damaged
+
 av1state() {
   "${B}/av1state" media/av1/av1-1-b8-01-size-16x16.ivf > "${B}/av1state.txt" ||
     { cat "${B}/av1state.txt"; return 1; }
@@ -66,6 +67,12 @@ plugins() {
 }
 check "the plug-ins' VideoToolbox side, with a stand-in decoder" plugins
 
+lists() {
+  ./check_lists.sh > "${B}/check_lists.txt" ||
+    { cat "${B}/check_lists.txt"; return 1; }
+}
+check "installer/validated-builds.json agrees with the decoders' driver lists" \
+  lists
 check "only AMD's accelerator is taken" "${B}/acceltest"
 check "a decode command that never finishes times out" "${B}/waittest"
 sessions() {
@@ -76,7 +83,8 @@ sessions() {
     { cat "${B}/sessiontest-av1.txt" "${B}/sessiontest-vp9.txt" 2>/dev/null |
         grep -v ^PASS; return 1; }
 }
-check "decoder sessions release the driver once, also after failures and a stuck GPU (made-up driver)" sessions
+check "decoder sessions release the driver once, also after failures and a \
+stuck GPU (made-up driver)" sessions
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"

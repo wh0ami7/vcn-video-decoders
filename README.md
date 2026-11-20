@@ -35,6 +35,30 @@ decode messages and submit them through the driver, then hand the frames back to
 VP9 is not in Apple's driver at all. `vcnvp9` builds the VCN VP9 messages itself, following the
 same layout as Mesa's `ac_vcn_dec.h`.
 
+## Decoders 0.3.3
+
+The two plug-ins report version 0.3.3 (they were 0.1). What changed since 0.1, in short:
+
+- Only AMD's accelerator is used. With an Intel iGPU active the decoders could take Intel's
+  accelerator, which AMD's driver refuses, and nothing decoded.
+- Each decode command has a time limit (1 s). The driver's own wait blocks in the kernel with no
+  limit, so a command the GPU never finished held the decoding process until a reboot. A stuck
+  session is closed on a background queue and later frames fail at once.
+- Each session releases its accelerator (`AVD_DestroyAVDAccelerator`), as Apple's decoders do.
+  Before, every session left three IOKit connections open until the process ended; Chrome keeps
+  one process for all its videos.
+- A stuck command or a failed driver call is reported as `kVTVideoDecoderMalfunctionErr`, not
+  as bad data, so the host can fall back to another decoder.
+- Plug-in threading: calls made from inside the output callback no longer trap or hang,
+  invalidate and finalize wait for the calls on their way in, finalize may run from the output
+  callback, and `canAcceptFormatDescription` no longer waits behind the GPU.
+- More stream checks before anything reaches the GPU (AV1 sequence header, references, tile
+  groups, VP9 bit depth and reference indices), and refused headers leave the parsers as they
+  were.
+
+Decoders 0.3.3 as a whole has not been run on a GPU yet. `tests/run.sh` runs the checks that need
+no GPU (see `tests/README.md`).
+
 ## Encoding fix (optional)
 
 macOS's hardware encoder leaves three things wrong on Navi 21: the video engine is never asked for clocks and
@@ -107,7 +131,14 @@ Test tools: `vcnav1/build.sh` builds `decode_ivf`, `vtav1test`, `probe_ctx` and 
 `vcnvp9/build.sh` builds `decode_vp9` and `vp9dump`, and `vtvp9/build.sh` also builds `vtvp9test`.
 A missing or unreadable reference, a frame missing from the output, a frame past the end of the
 reference and a damaged container are failures in `decode_ivf`, `decode_vp9`, `vtav1test` and
-`vtvp9test`.
+`vtvp9test`. `tests/README.md` lists which of them can hang the GPU.
+
+The tests that need no GPU (parsers, plug-in glue and driver sessions against a made-up
+driver, the validated-builds list) build and run with:
+
+```bash
+./tests/run.sh
+```
 
 The two kexts need Lilu's headers and MacKernelSDK:
 
@@ -117,6 +148,12 @@ KEXT_SDK=/path/to/sdk ./vcnvtkext/build.sh
 
 `KEXT_SDK` must contain `Lilu.kext` (a build that ships `Contents/Resources/Headers` and `Library`)
 and a `MacKernelSDK` checkout.
+
+`vcnvtkext` allows the two plug-ins by cdhash. `vcnvtkext/build.sh` runs `gen_cdhashes.sh` first,
+which rewrites `cdhashes.h` from `vtav1/build/` and `vtvp9/build/`: build both plug-ins first, and
+build the kext again whenever a plug-in is rebuilt. The checked-in `cdhashes.h` is from an
+earlier build of the plug-ins; the script overwrites it, and it only matches the exact bundles it
+was made from (see the cdhash note below).
 
 VCNEncodeFix builds the same way (`KEXT_SDK=/path/to/sdk ./vcnencodefix/build.sh`, writes
 `vcnencodefix/dist/`), and `build-app.sh` prefers that build. Without it, `build-app.sh` uses the checked-in
@@ -180,6 +217,8 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
 - Pinning the GPU clocks with stable power mode gave 4-5% at 4K and 1.4% at 8K, for about 27 W more
   at idle. Not worth it.
 - `vcnprofilekext`: the firmware accepted the VIDEO profile, but speed and power didn't change.
+- Decoders 0.3.3: built and checked on the CPU only (`tests/run.sh`, against a made-up driver).
+  Not run on a GPU yet.
 - `vcnvtkext`: the AMFI part works. The CoreMedia patch doesn't land on Tahoe because Lilu can't
   patch the split dyld shared cache, so the installer writes to `/System` instead.
 - VCNEncodeFix 1.2.2: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
