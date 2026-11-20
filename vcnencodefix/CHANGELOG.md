@@ -2,6 +2,10 @@
 
 ## 1.2.3 (not released)
 
+- vcnencodefix and vtenc are built for macOS 14.0 again. 1.2.2 built them for 26.0, so on Sonoma and Sequoia, which
+  the patch tables cover, they would not start at all. Built clean for 14.0 with no availability warning; not run on
+  14 or 15 here.
+
 - The service reopens its log after newsyslog rotated it. launchd opens the log once and newsyslog renames it at
   1 MB, so the service went on writing into the renamed file and /var/log/vcnencodefix.log stayed empty until the
   next restart (test.sh --wide then skipped its encode). Tried: the line after a rename goes to a new file.

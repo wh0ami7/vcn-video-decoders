@@ -44,14 +44,14 @@ codesign -f -s - $KX 2>/dev/null
 nm $KX/Contents/MacOS/VCNEncodeFloor | grep -q ' D _kmod_info' || { print "kmod_info missing"; exit 1; }
 
 print "== vcnencodefix"
-TFLAGS=(-arch x86_64 -mmacosx-version-min=26.0 -O2 -Wall -Wextra -Werror -fblocks "-DVERSION=\"$VERSION\"")
+TFLAGS=(-arch x86_64 -mmacosx-version-min=14.0 -O2 -Wall -Wextra -Werror -fblocks "-DVERSION=\"$VERSION\"")
 xcrun clang $TFLAGS tool/vcnencodefix.c tool/patches.c tool/efi.c tool/ocentry.c -framework CoreFoundation -o $B/vcnencodefix
 codesign -f -s - -i com.droga.vcnencodefix $B/vcnencodefix 2>/dev/null
 
 print "== vtenc (test encoder)"
-xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -O2 -Wall -c vtenc/vtenc.c -o $B/obj/vtenc.o
-xcrun clang -arch x86_64 -mmacosx-version-min=26.0 -O2 -Wall -fobjc-arc -c vtenc/gpusrc.m -o $B/obj/gpusrc.o
-xcrun clang -arch x86_64 -mmacosx-version-min=26.0 $B/obj/vtenc.o $B/obj/gpusrc.o -o $B/vtenc -framework VideoToolbox \
+xcrun clang -arch x86_64 -mmacosx-version-min=14.0 -O2 -Wall -c vtenc/vtenc.c -o $B/obj/vtenc.o
+xcrun clang -arch x86_64 -mmacosx-version-min=14.0 -O2 -Wall -fobjc-arc -c vtenc/gpusrc.m -o $B/obj/gpusrc.o
+xcrun clang -arch x86_64 -mmacosx-version-min=14.0 $B/obj/vtenc.o $B/obj/gpusrc.o -o $B/vtenc -framework VideoToolbox \
   -framework CoreMedia -framework CoreVideo -framework CoreFoundation -framework IOSurface -framework Metal -framework Foundation
 codesign -f -s - -i com.droga.vtenc $B/vtenc 2>/dev/null
 

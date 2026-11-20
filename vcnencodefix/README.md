@@ -63,7 +63,7 @@ Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into th
    ```
 
    This copies `VCNEncodeFloor.kext` to `EFI/OC/Kexts` and adds one entry at the end of `Kernel > Add` (after Lilu).
-   The installer first saves a copy of your config as `config.plist.backup-<date>-pre-vcnencodefix` next to it, and
+   The installer first saves a copy of your config as `config.plist.backup-<date>-<time>-pre-vcnencodefix` next to it, and
    checks afterwards that the file equals the original plus that one entry. Then reboot.
 
    Keep a way to boot another EFI (a USB stick with your previous EFI) in case something goes wrong; restoring the
@@ -73,7 +73,7 @@ Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into th
 
 ```
 ./doctor.sh          # what is installed and active (sudo ./doctor.sh also shows each encoder process)
-./test.sh            # three short encodes with reference numbers; writes a report to reports/
+./test.sh            # two short encodes with reference numbers; writes a report to reports/
 ./test.sh --wide     # adds one 5120x2160 HEVC encode (only runs if the fix is confirmed active)
 ```
 
@@ -95,7 +95,9 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   The default `speed` is the one measured above; the others were not measured.
 - `sudo ./install.sh --no-wide` or `--no-preset`: install with one of the two service fixes off.
 - Boot arguments for the kext: `-vcnflooroff` turns it off; `-vcnfloorall` also applies the floor to hardware
-  *decoding* (not tested).
+  *decoding* (not tested); `vcnfloor=N` replaces the floor value the kext requests (default 132297; 0 is ignored;
+  only the default was measured); `-vcnfloordbg` and `-vcnfloorbeta` are Lilu's usual debug and newer-macOS
+  switches.
 
 ## How it works
 
