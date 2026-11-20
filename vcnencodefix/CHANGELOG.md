@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.2.3 (not released)
+
+- The service reopens its log after newsyslog rotated it. launchd opens the log once and newsyslog renames it at
+  1 MB, so the service went on writing into the renamed file and /var/log/vcnencodefix.log stayed empty until the
+  next restart (test.sh --wide then skipped its encode). Tried: the line after a rename goes to a new file.
+- install.sh checks everything that can refuse before the first change: OpenCore on the EFI, Lilu and its version
+  (1.7.0 or newer, from the kext's own requirement), Lilu enabled, a config entry it can write (a disabled entry,
+  one before Lilu or with other settings is refused instead of failing after the service and the kext were
+  already replaced), and free space. The service files are staged first and the old service is only stopped once
+  that worked; the script waits for launchd to let go of it before starting the new one. The kext is swapped
+  through a .old copy with Ctrl-C held back. Exit status 2 when the service does not stay running.
+- uninstall.sh checks --efi before removing anything, removes the launchd plists before the binary (a plist left
+  alone would start a missing binary every 30 s), fails when the kext cannot be deleted, and removes leftover
+  .new/.old copies. Empty, relative and "/" --efi paths are handled in both.
+- doctor.sh shows the service's options and whether the installed binary is the package's, reads the boot
+  arguments the kernel started with, and always ends with 0.
+- test.sh --wide only counts log lines written during the test (an old line about a reused pid could let a
+  5120-wide encode through unpatched), stops its encode if the test is interrupted, refuses unknown options and
+  returns failures.
+- The config editor: efi-check no longer says "add updates it" for an old entry before Lilu, which add refuses; an
+  entry removed from a file with CRLF line ends keeps the rest of the file as it was.
+- efi_test.sh resolves its arguments before changing folder and refuses a missing tool or sample, which had let two
+  refusal tests pass.
+
 ## 1.2.2
 
 - The service needs SIP's Debugging Restrictions off (bit 0x4 of csr-active-config). With them on, macOS refuses

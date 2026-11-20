@@ -2,6 +2,10 @@
 # efi_test.sh <vcnencodefix> <sample OpenCore config.plist without the entry>
 # Exercises efi-add / efi-remove / efi-check on copies only, in a temporary folder. Exit status 0 = all passed.
 tool=${1:?tool}; sample=${2:?sample config}
+# absolute before the cd below, and both must be there: the refusal tests would pass on a missing tool or an empty copy
+tool=${tool:A}; sample=${sample:A}
+[[ -x $tool ]] || { print -u2 "$tool is not an executable"; exit 2; }
+[[ -s $sample ]] || { print -u2 "$sample is missing or empty"; exit 2; }
 T=$(mktemp -d)
 pass=0; fail=0
 ok()  { print -r -- "PASS $1"; pass=$((pass+1)); }

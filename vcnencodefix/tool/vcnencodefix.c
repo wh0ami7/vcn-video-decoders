@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/param.h>
 #include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -98,8 +99,36 @@ static struct {
   uint8_t call[kWideCallLen], cave[kWideCaveLen];
 } gWide;
 
+// The service's log, when standard output is a regular file (launchd's
+// StandardOutPath). newsyslog rotates it by renaming it; launchd keeps writing
+// to the renamed file, so before each line the path is compared with what
+// standard output is, and reopened.
+static char gLogPath[MAXPATHLEN];
+
+static void logReopen(void) {
+  if (!gLogPath[0]) return;
+  struct stat at, out;
+  if (fstat(STDOUT_FILENO, &out) == 0 && stat(gLogPath, &at) == 0 &&
+      at.st_dev == out.st_dev && at.st_ino == out.st_ino)
+    return;
+  int fd = open(gLogPath, O_WRONLY | O_APPEND | O_CREAT, 0644);
+  if (fd < 0) return;
+  fflush(stdout);
+  dup2(fd, STDOUT_FILENO);
+  dup2(fd, STDERR_FILENO);
+  close(fd);
+}
+
+static void logFollow(void) {
+  struct stat out;
+  if (fstat(STDOUT_FILENO, &out) == 0 && S_ISREG(out.st_mode) &&
+      fcntl(STDOUT_FILENO, F_GETPATH, gLogPath) == -1)
+    gLogPath[0] = 0;
+}
+
 static void logf_(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void logf_(const char* fmt, ...) {
+  logReopen();
   char ts[32];
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -992,6 +1021,9 @@ int main(int argc, char** argv) {
   }
   setup(preset, op, wide);
   if (!strcmp(cmd, "status")) return cmd_status();
-  if (!strcmp(cmd, "watch")) return cmd_watch(interval);
+  if (!strcmp(cmd, "watch")) {
+    logFollow();
+    return cmd_watch(interval);
+  }
   return cmd_one(pid, !strcmp(cmd, "unpatch"));
 }

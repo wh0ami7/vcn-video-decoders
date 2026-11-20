@@ -410,6 +410,8 @@ static char* text_remove(const Buf* in, size_t* outLen) {
   const char* to = e + strlen("</dict>");
   if (to < end && *to == '\n')
     to++;
+  else if (to + 1 < end && to[0] == '\r' && to[1] == '\n')  // CRLF file
+    to += 2;
   else
     return NULL;
   size_t pre = (size_t)(from - base), post = (size_t)(end - to);
@@ -490,7 +492,8 @@ int oc_entry_command(const char* what, const char* path, const OcKext* kext) {
       char how[400];
       if (same_entry(e)) {
         snprintf(how, sizeof(how), "settings as expected");
-      } else if (old_entry(e)) {
+      } else if (old_entry(e) && c.lilu >= 0 &&
+                 c.ours > c.lilu) {  // what add updates
         snprintf(how, sizeof(how),
                  "old entry with MinKernel %s (current: %s): add updates it",
                  K->oldMinKernel, K->minKernel);
