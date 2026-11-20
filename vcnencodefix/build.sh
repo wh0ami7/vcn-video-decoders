@@ -5,10 +5,16 @@
 # plugin_start.cpp) and MacKernelSDK: KEXT_SDK (or LILU_SDK), default ~/re_cache/work/ryzen_kext_build.
 # The EFI tests use OpenCore's Docs/Sample.plist (OC_SAMPLE, default ~/re_cache/oc_fork/OpenCorePkg/Docs/Sample.plist);
 # they are skipped when it is missing. The last test only reports whether this Mac has the patched Apple files.
+#
+# VERSION_OVERRIDE=<x.y.z> builds with another version string (to compare a build with a released one).
+#
+# The kext carries its build date (Lilu's version string). It is taken from SOURCE_DATE_EPOCH, which
+# defaults to the date of the last commit, so the same commit and the same Lilu give the same kext.
 emulate -L zsh
 setopt err_exit no_unset pipe_fail
 cd "${0:A:h}"
-VERSION=$(<VERSION)
+VERSION=${VERSION_OVERRIDE:-$(<VERSION)}
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}
 SDK=${KEXT_SDK:-${LILU_SDK:-~/re_cache/work/ryzen_kext_build}}
 [[ -d $SDK/Lilu.kext && -d $SDK/MacKernelSDK ]] || { print "set KEXT_SDK to a folder holding Lilu.kext and MacKernelSDK"; exit 1; }
 OC_SAMPLE=${OC_SAMPLE:-~/re_cache/oc_fork/OpenCorePkg/Docs/Sample.plist}

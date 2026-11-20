@@ -64,7 +64,7 @@ no GPU (see `tests/README.md`).
 macOS's hardware encoder leaves three things wrong on Navi 21: the video engine is never asked for clocks and
 can stay at its lowest speed for a whole recording, no speed preset is ever selected, and every HEVC frame wider
 than 4096 runs a small GPU job with more threads per group than the GPU allows, which stalls it.
-**VCNEncodeFix 1.2.2** fixes all three with a background service (patches the encoder process in memory, no reboot)
+**VCNEncodeFix 1.2.4** fixes all three with a background service (patches the encoder process in memory, no reboot)
 and an optional Lilu kext in the OpenCore EFI (clock floor while encoding). It never touches the system volume.
 
 It is separate from the decoders: the installer shows it in its own collapsed section, with its own checks
@@ -81,6 +81,11 @@ Requirements and behaviour that matter in 1.2.x:
   (Tahoe only) skip the kext on Sequoia; run Install again on the EFI to rewrite that one line (with a backup).
 - The service runs as launchd **Interactive** and re-checks spawning pids every 10 ms so a new encoder is patched
   before the first wide HEVC frame under CPU load.
+- New in 1.2.3 and 1.2.4: the service and `vtenc` are built for macOS 14.0 (the 1.2.2 binaries were built for 26.0
+  and would not start on Sequoia); the service log keeps growing after newsyslog rotates it; a service macOS refuses
+  access to is logged once instead of four times a second; the package scripts check everything before changing
+  anything; the kext sets its clock floor only on chips whose clock levels were read (Navi 21, and Navi 23, which
+  was never run). Details in `vcnencodefix/CHANGELOG.md`.
 
 Results so far: only Tahoe 26.7.3 has been measured on a GPU here (RX 6800 XT, OBS 33) — HEVC 4K60 from 55 %
 repeated frames to 0.3 %, 3840x4320@30 from about 10 fps to real time, 5120x2160@30 from GPU stalls to real time.
@@ -221,9 +226,12 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
   Not run on a GPU yet.
 - `vcnvtkext`: the AMFI part works. The CoreMedia patch doesn't land on Tahoe because Lilu can't
   patch the split dyld shared cache, so the installer writes to `/System` instead.
-- VCNEncodeFix 1.2.2: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
-  Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures). Full kext package build still needs
-  `KEXT_SDK` (Lilu + MacKernelSDK); without it the installer embeds `vcnencodefix/prebuilt/`.
+- VCNEncodeFix 1.2.4: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
+  Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures), the floor rule test for 20 AMD
+  device-ids, 23 EFI tests. 1.2.4 was booted on an RX 6800 XT (Tahoe 26.7.3); not run on a Navi 23.
+  Full kext package build still needs `KEXT_SDK` (Lilu + MacKernelSDK); without it the installer
+  embeds `vcnencodefix/prebuilt/`. `prebuilt/VCNEncodeFix-1.2.4.zip` was built with
+  `SOURCE_DATE_EPOCH=1795108821`; its kext has the same bytes as the 1.2.4 kext built in DrogaBoxGPU.
 
 ## Checking support
 
