@@ -2,6 +2,10 @@
 
 ## 1.2.3 (not released)
 
+- watch: an encoder service macOS refuses access to (SIP Debugging Restrictions on) was asked again on every
+  full scan, four times a second, with one log line each time, for as long as it ran. It is now logged once and
+  remembered like a patched service. A failed allocation of the pid lists no longer leaves a NULL list in use,
+  and `--interval` takes 20 to 60000 ms (a negative value used to become a huge one).
 - vcnencodefix and vtenc are built for macOS 14.0 again. 1.2.2 built them for 26.0, so on Sonoma and Sequoia, which
   the patch tables cover, they would not start at all. Built clean for 14.0 with no availability warning; not run on
   14 or 15 here.

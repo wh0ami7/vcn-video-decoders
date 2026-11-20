@@ -736,6 +736,9 @@ static void consider(pid_t pid, bool preset, bool wide) {
   if (kr != KERN_SUCCESS) {
     logf_("pid %d: task_for_pid failed (%s)%s", pid, mach_error_string(kr),
           sip_blocks_access() ? ": SIP Debugging Restrictions are on" : "");
+    // Remembered like a patched service, so it is not asked again (and logged
+    // again) on every scan while it runs: the refusal holds until a reboot.
+    gSvc[freeSlot] = (Svc){pid, st, false, false, 0, 0};
     return;
   }
   char line[700] = "", msg[300];
@@ -829,21 +832,13 @@ static int cmd_watch(unsigned intervalMs) {
     gTick = tick;
     int want = proc_listallpids(NULL, 0) + 256;
     if (want > cap) {
-      int ncap = want;
-      pid_t* ncur = realloc(cur, (size_t)ncap * sizeof(pid_t));
-      pid_t* nprev = realloc(prev, (size_t)ncap * sizeof(pid_t));
-      if (!ncur || !nprev) {
-        logf_("out of memory growing pid lists");
-        free(ncur ? ncur : cur);
-        free(nprev ? nprev : prev);
-        cur = prev = NULL;
-        cap = prevN = 0;
-        usleep(10000);
-        continue;
-      }
-      cur = ncur;
-      prev = nprev;
-      cap = ncap;
+      pid_t* c = realloc(cur, (size_t)want * sizeof(pid_t));
+      if (c) cur = c;
+      pid_t* p = c ? realloc(prev, (size_t)want * sizeof(pid_t)) : NULL;
+      if (p) prev = p;
+      // On a failed allocation the old lists stay, and the pids that do not
+      // fit wait for the next tick.
+      if (c && p) cap = want;
     }
     int n = cur ? proc_listallpids(cur, cap * (int)sizeof(pid_t)) : 0;
     if (n > 0) {
@@ -1013,6 +1008,7 @@ int main(int argc, char** argv) {
         }
         interval = (unsigned)v;
         if (interval < 20) interval = 20;
+        if (interval > 60000) interval = 60000;
       }
     } else {
       usage();
