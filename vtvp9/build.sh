@@ -25,7 +25,7 @@ clang -arch x86_64 -O1 -g -Wall -Wextra -Wno-unused-parameter -Wno-four-char-con
   -fstack-protector-strong -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security \
   -fno-strict-overflow \
   -Wno-deprecated-declarations -mmacosx-version-min=13.0 \
-  vtvp9test.c ../vcnvp9/vp9parse.c \
+  -I../vcnvp9 vtvp9test.c ../vcnvp9/vp9parse.c \
   -framework CoreFoundation -framework CoreMedia -framework CoreVideo \
   -framework VideoToolbox \
   -o vtvp9test

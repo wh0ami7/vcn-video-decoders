@@ -1,11 +1,22 @@
-// Apply a RIDIFF10 image patch (e.g.
-// payloadv2/image_patches/cryptex-system-x86_64) with no source image,
-// producing the full disk image, using libParallelCompression's RawImagePatch.
-//   rawpatch <patch> <out.dmg>
+// rawpatch: turns an image patch of a macOS update into the full disk image,
+// so the driver of a macOS build can be checked before that build is
+// installed. It calls macOS's own RawImagePatch (libParallelCompression) with
+// no source image.
+//
+// usage: rawpatch <patch> <out.dmg>
+//   <patch>  a RIDIFF10 file from the update, for example
+//            payloadv2/image_patches/cryptex-system-x86_64
+//
+// Mount the result read-only and hand its dyld shared cache
+// (System/Library/dyld/dyld_shared_cache_x86_64h) to tools/dscdiff.py.
+// The image is Apple's: keep it out of this repository.
+//
+// Build: clang -O2 tools/rawpatch.c -o tools/rawpatch
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 
+// The argument of RawImagePatch. Only the fields set below are known.
 typedef struct {
   const char* input;   // +0x00 source image (NULL: patch from nothing)
   const void* unk08;   // +0x08
@@ -18,8 +29,8 @@ typedef struct {
 } RawImagePatchArgs;
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    fprintf(stderr, "usage: rawpatch <patch> <out>\n");
+  if (argc != 3 || argv[1][0] == '-') {
+    fprintf(stderr, "usage: rawpatch <patch> <out.dmg>\n");
     return 1;
   }
   void* h = dlopen("/usr/lib/libParallelCompression.dylib", RTLD_NOW);
@@ -34,7 +45,6 @@ int main(int argc, char** argv) {
   a.output = argv[2];
   a.verbose = 3;
   int r = fn(&a);
-  perror("errno");
   printf("RawImagePatch -> %d\n", r);
   return r != 0;
 }

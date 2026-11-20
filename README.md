@@ -103,8 +103,11 @@ Each script writes the bundle to its own `build/` folder. The installer packages
 ./installer/make-dmg.sh
 ```
 
-Test tools: `vcnav1/build.sh` builds `decode_ivf` and `vtav1test`, `vcnvp9/build.sh` builds
-`decode_vp9`, and `vtvp9/build.sh` also builds `vtvp9test`.
+Test tools: `vcnav1/build.sh` builds `decode_ivf`, `vtav1test`, `probe_ctx` and `tools/driveruuid`,
+`vcnvp9/build.sh` builds `decode_vp9` and `vp9dump`, and `vtvp9/build.sh` also builds `vtvp9test`.
+A missing or unreadable reference, a frame missing from the output, a frame past the end of the
+reference and a damaged container are failures in `decode_ivf`, `decode_vp9`, `vtav1test` and
+`vtvp9test`.
 
 The two kexts need Lilu's headers and MacKernelSDK:
 

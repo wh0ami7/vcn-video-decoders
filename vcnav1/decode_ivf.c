@@ -1,6 +1,18 @@
-// Decode an AV1 IVF file on the VCN and print per-frame I420 MD5 (libaom
-// test-vector format), optionally comparing against an .md5 file. usage:
-// decode_ivf file.ivf [expected.md5] [-v] [-o out.yuv]
+// decode_ivf: decodes an AV1 IVF file on the VCN, without VideoToolbox, and
+// prints the MD5 of every shown frame as I420 (the format of the libaom test
+// vectors). With a reference file it compares each frame.
+//
+// usage: decode_ivf file.ivf [expected.md5] [-v] [-o out.yuv] [-n]
+//   -v  prints what the decoder session does
+//   -o  also writes the frames to a file, as raw I420
+//   -n  reads no pixels: for timing
+//
+// It reaches the GPU, so the decoder session refuses to submit anything unless
+// VCNAV1_ALLOW_GPU=yes-i-know-it-can-hang is set. TU_TIMES=1 prints the time of
+// every temporal unit.
+//
+// Exit status: 0 = every frame matched, 2 = a frame differs or is missing,
+// 1 = anything else.
 #include <CommonCrypto/CommonDigest.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
@@ -12,7 +24,6 @@
 typedef struct {
   int frames, mismatches;
   FILE *md5, *out;
-  const char* name;
   int nohash;
   double cb_ms;
 } Ctx;
@@ -33,13 +44,20 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const AV1Parser* p,
     c->cb_ms += now_ms() - t0;
     return;
   }
-  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
   int w = p->fh.UpscaledWidth, h = p->fh.FrameHeight;
   if (p->fh.show_existing_frame) {
     const AV1RefSlot* r = &p->ref[p->fh.frame_to_show_map_idx];
     w = r->upscaled_width;
     h = r->frame_height;
   }
+  uint8_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    fprintf(stderr, "out of memory hashing a frame\n");
+    c->frames++;
+    c->mismatches++;
+    return;
+  }
+  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
   bool ten = IOSurfaceGetPixelFormat(s) == 'x420';
   int bpe = ten ? 2 : 1;
   uint8_t *y = IOSurfaceGetBaseAddressOfPlane(s, 0),
@@ -49,11 +67,6 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const AV1Parser* p,
   CC_MD5_CTX m;
   CC_MD5_Init(&m);
   int cw = (w + 1) / 2, ch = (h + 1) / 2;
-  uint8_t* row = malloc((size_t)w * 2 + 16);
-  if (!row) {
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-    return;
-  }
   for (int r = 0; r < h; r++) {
     if (ten) {  // P010 -> little-endian 16-bit samples (value in low 10 bits)
       uint16_t *src = (uint16_t*)(y + r * ys), *dst = (uint16_t*)row;
@@ -93,8 +106,25 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const AV1Parser* p,
   if (!ok) c->mismatches++;
   printf("frame %3d %dx%d %s%s%s\n", c->frames, w, h, hex,
          c->md5 ? (ok ? "  OK" : "  MISMATCH expected ") : "",
-         ok ? "" : expect);
+         ok ? "" : (expect[0] ? expect : "(reference ended)"));
   c->cb_ms += now_ms() - t0;
+}
+
+// Reference lines that no decoded frame used up.
+static int references_left(FILE* md5) {
+  char line[512], word[64];
+  int n = 0;
+  while (fgets(line, sizeof(line), md5))
+    if (sscanf(line, "%63s", word) == 1) n++;
+  return n;
+}
+
+static int usage(void) {
+  fprintf(stderr,
+          "usage: decode_ivf file.ivf [expected.md5] [-v] [-o out.yuv] [-n]\n"
+          "Reaches the GPU only with "
+          "VCNAV1_ALLOW_GPU=yes-i-know-it-can-hang.\n");
+  return 1;
 }
 
 int main(int argc, char** argv) {
@@ -117,23 +147,17 @@ int main(int argc, char** argv) {
       outp = argv[i];
     } else if (!strcmp(argv[i], "-n")) {
       nohash = 1;
+    } else if (argv[i][0] == '-') {
+      return usage();
     } else if (!path) {
       path = argv[i];
     } else if (!md5) {
       md5 = argv[i];
     } else {
-      fprintf(
-          stderr,
-          "usage: decode_ivf file.ivf [expected.md5] [-v] [-o out.yuv] [-n]\n");
-      return 1;
+      return usage();
     }
   }
-  if (!path) {
-    fprintf(
-        stderr,
-        "usage: decode_ivf file.ivf [expected.md5] [-v] [-o out.yuv] [-n]\n");
-    return 1;
-  }
+  if (!path) return usage();
 
   fp = fopen(path, "rb");
   if (!fp) {
@@ -155,7 +179,6 @@ int main(int argc, char** argv) {
     goto done;
   }
 
-  c.name = path;
   c.nohash = nohash;
   if (md5) {
     c.md5 = fopen(md5, "r");
@@ -176,7 +199,8 @@ int main(int argc, char** argv) {
   size_t header_read = 0;
   while ((header_read = fread(fh, 1, sizeof(fh), fp)) == sizeof(fh)) {
     uint32_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (uint32_t)fh[3] << 24;
-    // Bound hostile IVF sizes before allocation (matches VCN BS_SIZE).
+    // The largest temporal unit the decoder session takes (its BS_SIZE). An
+    // empty one is reported as a damaged file.
     enum { kMaxTuBytes = 0x1800000u };
     if (!sz || sz > kMaxTuBytes) {
       fprintf(stderr, "invalid frame size %u at TU %d\n", sz, n);
@@ -208,18 +232,24 @@ int main(int argc, char** argv) {
     }
   }
   if (ferror(fp) || header_read) {
-    fprintf(stderr, "error reading %s\n", path);
+    fprintf(stderr, "error reading %s: the file ends inside a frame header\n",
+            path);
     goto done;
   }
 
+  // A decoder that shows fewer frames than the reference lists must not pass.
+  int missing = c.md5 && !nohash ? references_left(c.md5) : 0;
+  if (missing)
+    printf("%d reference frame(s) were never decoded  MISSING\n", missing);
   double total = t_start ? now_ms() - t_start : 0;
   double dec = total - c.cb_ms;
-  printf("%s: %d frames, %d mismatches\n", path, c.frames, c.mismatches);
+  printf("%s: %d frames, %d mismatches\n", path, c.frames,
+         c.mismatches + missing);
   printf(
       "timing: %.1f ms decode-only (%.1f fps), worst TU %.2f ms, %.1f ms in "
       "output callback\n",
       dec, dec > 0 ? c.frames * 1000.0 / dec : 0.0, worst, c.cb_ms);
-  exit_code = c.mismatches ? 2 : 0;
+  exit_code = c.mismatches || missing ? 2 : 0;
 
 done:
   free(buf);

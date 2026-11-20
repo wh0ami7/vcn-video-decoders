@@ -1,9 +1,12 @@
 // Minimal IVF and WebM readers for the test tools: one chunk per container
-// frame, video track only, no lacing.
-
-#ifndef VCNVP9_CONTAINER_H_
-#define VCNVP9_CONTAINER_H_
-
+// frame, video track only, no lacing. The whole file is read into memory.
+//
+// A reader that stops early would make a test pass on half a file, so the two
+// ways of stopping are kept apart: at the clean end of the file
+// container_next() returns false and leaves `problem` NULL; when the file is
+// damaged or cut short it returns false and `problem` says why.
+#pragma once
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,54 +17,50 @@ typedef struct {
   uint8_t* data;
   size_t size, pos;
   bool ivf;
-  // WebM walk: end of the cluster being read
-  size_t cluster_end;
   // First video track from Tracks; 0 until it is seen.
   uint64_t video_track;
+  // Why the file could not be opened or read to its end; NULL when all is
+  // well.
+  const char* problem;
 } Container;
 
-static inline bool container_open(Container* c, const char* path) {
-  // Cap test-tool loads so a hostile file cannot OOM the process.
-  enum { kMaxContainerBytes = 512u * 1024u * 1024u };
+// The file is loaded whole. 4 GiB holds any test clip, long 4K benchmark files
+// included, and still stops a wrong path (a disk image, a device) early.
+static const uint64_t kContainerMaxBytes = (uint64_t)4 << 30;
+
+static inline bool container_fail(Container* c, FILE* fp, const char* why) {
+  if (fp) fclose(fp);
+  free(c->data);
   memset(c, 0, sizeof(*c));
-  if (!path) return false;
+  c->problem = why;
+  return false;
+}
+
+static inline bool container_open(Container* c, const char* path) {
+  memset(c, 0, sizeof(*c));
+  if (!path) return container_fail(c, NULL, "no file name");
   FILE* fp = fopen(path, "rb");
-  if (!fp) return false;
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    fclose(fp);
-    return false;
-  }
+  if (!fp) return container_fail(c, NULL, strerror(errno));
+  if (fseek(fp, 0, SEEK_END) != 0)
+    return container_fail(c, fp, "cannot find the end of the file");
   long n = ftell(fp);
-  if (n < 0 || (unsigned long)n > kMaxContainerBytes ||
-      fseek(fp, 0, SEEK_SET) != 0) {
-    fclose(fp);
-    return false;
-  }
+  if (n < 0 || fseek(fp, 0, SEEK_SET) != 0)
+    return container_fail(c, fp, "cannot read the size of the file");
+  if ((uint64_t)n > kContainerMaxBytes)
+    return container_fail(c, fp, "larger than 4 GiB");
   if (n > 0) {
     c->data = (uint8_t*)malloc((size_t)n);
-    if (!c->data) {
-      fclose(fp);
-      return false;
-    }
+    if (!c->data) return container_fail(c, fp, "out of memory");
+    c->size = fread(c->data, 1, (size_t)n, fp);
+    if (ferror(fp) || c->size != (size_t)n)
+      return container_fail(c, fp, "read error");
   }
-  c->size = n > 0 ? fread(c->data, 1, (size_t)n, fp) : 0;
-  bool ok = !ferror(fp) && c->size == (size_t)n;
   fclose(fp);
-  if (!ok) {
-    free(c->data);
-    c->data = NULL;
-    c->size = 0;
-    return false;
-  }
   if (c->size >= 32 && !memcmp(c->data, "DKIF", 4)) {
     c->ivf = true;
     size_t hdr = (size_t)(c->data[6] | (c->data[7] << 8));
-    if (hdr < 32 || hdr > c->size) {
-      free(c->data);
-      c->data = NULL;
-      c->size = 0;
-      return false;
-    }
+    if (hdr < 32 || hdr > c->size)
+      return container_fail(c, NULL, "bad IVF header length");
     c->pos = hdr;
   }
   return true;
@@ -116,7 +115,7 @@ static inline void webm_read_tracks(Container* c, size_t end) {
     uint32_t id;
     uint64_t sz;
     if (!ebml_id(c, &id) || !ebml_size(c, &sz, NULL)) break;
-    if (sz > end - c->pos) break;
+    if (c->pos > end || sz > end - c->pos) break;
     if (id == 0xAE) {  // TrackEntry
       size_t entry_end = c->pos + (size_t)sz;
       uint64_t number = 0, type = 0;
@@ -124,7 +123,7 @@ static inline void webm_read_tracks(Container* c, size_t end) {
         uint32_t eid;
         uint64_t esz;
         if (!ebml_id(c, &eid) || !ebml_size(c, &esz, NULL) ||
-            esz > entry_end - c->pos)
+            c->pos > entry_end || esz > entry_end - c->pos)
           break;
         if ((eid == 0xD7 || eid == 0x83) && esz <= 8) {
           uint64_t v = 0;
@@ -146,40 +145,74 @@ static inline void webm_read_tracks(Container* c, size_t end) {
 }
 
 // Next frame of the file, pointing into the file's memory. Returns false at the
-// end.
+// end of the file, and also when the file cannot be read further: then
+// c->problem is set.
 static inline bool container_next(Container* c, const uint8_t** out,
                                   size_t* size) {
+  if (c->problem) return false;
   if (c->ivf) {
-    if (c->pos + 12 > c->size) return false;
+    if (c->pos >= c->size) return false;
+    if (c->size - c->pos < 12) {
+      c->problem = "the file ends inside a frame header";
+      return false;
+    }
     const uint8_t* h = c->data + c->pos;
     size_t s = (size_t)h[0] | (size_t)h[1] << 8 | (size_t)h[2] << 16 |
                (size_t)h[3] << 24;
-    enum { kMaxFrameBytes = 0x1800000u };
     c->pos += 12;
-    if (!s || s > kMaxFrameBytes || c->pos + s > c->size) return false;
+    // An empty frame is reported as a damaged file. A frame that is too big
+    // for the decoder is passed on: the decoder says so itself.
+    if (!s) {
+      c->problem = "a frame with no bytes";
+      return false;
+    }
+    if (s > c->size - c->pos) {
+      c->problem = "the file ends inside a frame";
+      return false;
+    }
     *out = c->data + c->pos;
     *size = s;
     c->pos += s;
     return true;
   }
   for (;;) {
+    if (c->pos >= c->size) return false;
     uint32_t id;
     uint64_t sz;
     bool unknown = false;
-    if (!ebml_id(c, &id) || !ebml_size(c, &sz, &unknown)) return false;
+    if (!ebml_id(c, &id) || !ebml_size(c, &sz, &unknown)) {
+      c->problem = "damaged element header, or not an IVF or WebM file";
+      return false;
+    }
     if (id == 0x18538067 || id == 0x1F43B675 || id == 0xA0)
       continue;  // Segment, Cluster, BlockGroup: descend
-    if (unknown) return false;
-    if (sz > c->size - c->pos) return false;
+    if (unknown) {
+      c->problem = "an element of unknown size that cannot be skipped";
+      return false;
+    }
+    if (sz > c->size - c->pos) {
+      c->problem = "the file ends inside an element";
+      return false;
+    }
     if (id == 0x1654AE6B) webm_read_tracks(c, c->pos + (size_t)sz);
     if (id == 0xA3 || id == 0xA1) {  // SimpleBlock, Block
       size_t start = c->pos;
       uint64_t track;
-      if (!ebml_size(c, &track, NULL)) return false;
+      if (!ebml_size(c, &track, NULL)) {
+        c->problem = "damaged block header";
+        return false;
+      }
       size_t head = c->pos - start + 3;  // track number, timecode, flags
-      if (head > sz) return false;
+      if (head > sz) {
+        c->problem = "a block shorter than its own header";
+        return false;
+      }
       c->pos = start + (size_t)sz;
       if (c->video_track && track != c->video_track) continue;
+      if (head == sz) {
+        c->problem = "a frame with no bytes";
+        return false;
+      }
       *out = c->data + start + head;
       *size = (size_t)sz - head;
       return true;
@@ -187,5 +220,3 @@ static inline bool container_next(Container* c, const uint8_t** out,
     c->pos += (size_t)sz;
   }
 }
-
-#endif  // VCNVP9_CONTAINER_H_

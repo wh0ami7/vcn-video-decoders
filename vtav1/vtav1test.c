@@ -1,20 +1,37 @@
-// Exercise the av01 decoder through the public VideoToolbox API, as
-// Safari/WebKit does.
-//   vtav1test list                       -> show av01 decoders VideoToolbox
-//   knows about vtav1test <file.ivf> [file.md5] [-n] -> decode with
-//   VTDecompressionSession (hardware required),
-//                                           compare per-frame I420 MD5, report
-//                                           timing
+// vtav1test: drives an av01 decoder through the public VideoToolbox API, the
+// way Safari does.
+//
+//   vtav1test [-load bundle] list
+//       shows the av01 decoders VideoToolbox knows about (LIST_ALL=1: all of
+//       them)
+//   vtav1test [-load bundle] file.ivf [file.md5] [-n] [-a] [-pace fps]
+//             [-id decoder]
+//       decodes the file with a VTDecompressionSession that requires
+//       hardware, compares the MD5 of every frame as I420 with the reference,
+//       and reports timing
+//
+// -load registers the bundle in this process only, nothing is installed on the
+// system. -n reads no pixels, -a decodes asynchronously, -pace feeds at a fixed
+// rate and reports lateness, -id picks one decoder when several handle av01
+// (the installed one and a -load'ed build).
+// VTAV1_DUMP_Y=<file> appends the 8-bit luma of every frame to that file.
+//
+// There is no switch to arm here: a decode run goes to the GPU as soon as an
+// AV1 hardware decoder is installed or loaded.
+//
+// Exit status: 0 = every frame decoded and matched, 2 = a frame failed,
+// differs or is missing, 1 = anything else.
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreMedia/CoreMedia.h>
 #include <VideoToolbox/VideoToolbox.h>
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "../vcnav1/av1parse.h"
+#include "av1parse.h"
 
 static double now_ms(void) {
   static mach_timebase_info_data_t tb;
@@ -22,17 +39,18 @@ static double now_ms(void) {
   return (double)mach_absolute_time() * tb.numer / tb.denom / 1e6;
 }
 
-#include <dlfcn.h>
 static void copy_kv(const void* k, const void* v, void* dict) {
   CFDictionarySetValue(dict, k, v);
 }
+
 // Register a decoder bundle in this process only (nothing is installed on the
-// system).
+// system). Fails when nothing was registered: the run would then test the
+// installed decoder while looking like a test of this bundle.
 static int load_bundle(const char* path) {
   CFURLRef url = CFURLCreateFromFileSystemRepresentation(
-      NULL, (const UInt8*)path, strlen(path), true);
-  CFBundleRef b = CFBundleCreate(NULL, url);
-  CFRelease(url);
+      NULL, (const UInt8*)path, (CFIndex)strlen(path), true);
+  CFBundleRef b = url ? CFBundleCreate(NULL, url) : NULL;
+  if (url) CFRelease(url);
   if (!b || !CFBundleLoadExecutable(b)) {
     fprintf(stderr, "cannot load %s\n", path);
     return -1;
@@ -41,25 +59,33 @@ static int load_bundle(const char* path) {
       CFBundleGetValueForInfoDictionaryKey(b, CFSTR("CMClassImplementations"));
   OSStatus (*reg)(FourCharCode, CFDictionaryRef, void*) =
       dlsym(RTLD_DEFAULT, "VTRegisterVideoDecoderWithInfo");
+  int registered = 0;
   for (CFIndex i = 0; impls && reg && i < CFArrayGetCount(impls); i++) {
     CFDictionaryRef impl = CFArrayGetValueAtIndex(impls, i);
     CFStringRef fn = CFDictionaryGetValue(impl, CFSTR("CMFactoryFunction"));
-    void* factory = CFBundleGetFunctionPointerForName(b, fn);
+    void* factory = fn ? CFBundleGetFunctionPointerForName(b, fn) : NULL;
+    if (!factory) continue;
     CFMutableDictionaryRef info = CFDictionaryCreateMutableCopy(NULL, 0, impl);
     // Dynamic registration ignores CMMatchingInfo: lift the matching keys to
     // the top level.
     CFDictionaryRef match = CFDictionaryGetValue(impl, CFSTR("CMMatchingInfo"));
     if (match) CFDictionaryApplyFunction(match, copy_kv, info);
     CFDictionarySetValue(info, CFSTR("IsHardwareAccelerated"), kCFBooleanTrue);
-    CFDictionarySetValue(
-        info, CFSTR("CodecName"),
-        CFDictionaryGetValue(impl, CFSTR("CMClassImplementationName")));
+    CFStringRef name =
+        CFDictionaryGetValue(impl, CFSTR("CMClassImplementationName"));
+    if (name) CFDictionarySetValue(info, CFSTR("CodecName"), name);
     OSStatus st = reg(kCMVideoCodecType_AV1, info, factory);
     CFRelease(info);
     printf("registered %p from %s -> %d\n", factory, path, (int)st);
+    if (!st) registered++;
+  }
+  if (!registered) {
+    fprintf(stderr, "no decoder of %s could be registered\n", path);
+    return -1;
   }
   return 0;
 }
+
 static int list(void) {
   OSStatus (*copyList)(CFDictionaryRef, CFArrayRef*) =
       dlsym(RTLD_DEFAULT, "VTCopyVideoDecoderList");
@@ -81,6 +107,7 @@ static int list(void) {
   if (decs) CFRelease(decs);
   return 0;
 }
+
 typedef struct {
   FILE* md5;
   int frames, mismatches, errors, nohash;
@@ -102,10 +129,16 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
   }
   c->frames++;
   if (c->nohash) return;
+  int w = (int)CVPixelBufferGetWidth(img), h = (int)CVPixelBufferGetHeight(img);
+  uint16_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    c->errors++;
+    printf("frame %d: out of memory hashing it\n", c->frames);
+    return;
+  }
   CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
   OSType fmt = CVPixelBufferGetPixelFormatType(img);
   int ten = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
-  int w = (int)CVPixelBufferGetWidth(img), h = (int)CVPixelBufferGetHeight(img);
   uint8_t *y = CVPixelBufferGetBaseAddressOfPlane(img, 0),
           *uv = CVPixelBufferGetBaseAddressOfPlane(img, 1);
   size_t ys = CVPixelBufferGetBytesPerRowOfPlane(img, 0),
@@ -132,15 +165,14 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
       if (df) fclose(df);
     }
   }
-  uint16_t* row = malloc((size_t)w * 2 + 16);
-  if (!row) return;
   for (int r = 0; r < h; r++) {
     if (ten) {
       uint16_t* src = (uint16_t*)(y + r * ys);
       for (int i = 0; i < w; i++) row[i] = src[i] >> 6;
       CC_MD5_Update(&m, row, w * 2);
-    } else
+    } else {
       CC_MD5_Update(&m, y + r * ys, w);
+    }
   }
   for (int pl = 0; pl < 2; pl++)
     for (int r = 0; r < ch; r++) {
@@ -166,7 +198,7 @@ static void out_cb(void* refcon, void* frameRefcon, OSStatus st,
     if (strcmp(expect, hex)) {
       c->mismatches++;
       printf("frame %d %dx%d %s MISMATCH expected %s\n", c->frames, w, h, hex,
-             expect);
+             expect[0] ? expect : "(reference ended)");
     }
   }
 }
@@ -208,7 +240,7 @@ static CFDataRef make_av1C(const uint8_t* tu, size_t n) {
       av1_parser_free(&ps);
       CFMutableDataRef d = CFDataCreateMutable(NULL, 0);
       CFDataAppendBytes(d, rec, 4);
-      CFDataAppendBytes(d, tu + o, obu_len);
+      CFDataAppendBytes(d, tu + o, (CFIndex)obu_len);
       return d;
     }
     o = p + sz;
@@ -216,39 +248,58 @@ static CFDataRef make_av1C(const uint8_t* tu, size_t n) {
   return NULL;
 }
 
+static int usage(void) {
+  fprintf(stderr,
+          "usage: vtav1test [-load bundle] list\n"
+          "       vtav1test [-load bundle] file.ivf [file.md5] [-n] [-a] "
+          "[-pace fps] [-id decoder]\n"
+          "A decode run goes to the GPU: there is no switch to arm.\n");
+  return 1;
+}
+
+static int fail(const char* what) {
+  fprintf(stderr, "%s\n", what);
+  return 1;
+}
+
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    fprintf(stderr, "usage: vtav1test list | file.ivf [file.md5] [-n]\n");
-    return 1;
-  }
-  if (argc > 2 && !strcmp(argv[1], "-load")) {
+  if (argc < 2) return usage();
+  if (!strcmp(argv[1], "-load")) {
+    if (argc < 4) return usage();
     if (load_bundle(argv[2])) return 1;
     argv += 2;
     argc -= 2;
   }
   if (!strcmp(argv[1], "list")) return list();
+  if (argv[1][0] == '-') return usage();
   Ctx c = {0};
   int async = 0;
   double pace = 0;  // feed frames at this rate (fps) and report output latency
-  const char* decoderID = NULL;
+  const char *decoderID = NULL, *md5Path = NULL;
   for (int i = 2; i < argc; i++) {
-    if (!strcmp(argv[i], "-n"))
+    if (!strcmp(argv[i], "-n")) {
       c.nohash = 1;
-    else if (!strcmp(argv[i], "-a"))
+    } else if (!strcmp(argv[i], "-a")) {
       async = 1;
-    else if (!strcmp(argv[i], "-pace") && i + 1 < argc) {
+    } else if (!strcmp(argv[i], "-pace") && i + 1 < argc) {
       const char* s = argv[++i];
       char* end = NULL;
       double v = strtod(s, &end);
-      if (!end || end == s || *end || v < 0) {
-        fprintf(stderr, "invalid -pace\n");
-        return 1;
-      }
+      if (!end || end == s || *end || !(v >= 0)) return fail("invalid -pace");
       pace = v;
-    } else if (!strcmp(argv[i], "-id") && i + 1 < argc)
+    } else if (!strcmp(argv[i], "-id") && i + 1 < argc) {
       decoderID = argv[++i];
-    else
-      c.md5 = fopen(argv[i], "r");
+    } else if (argv[i][0] == '-' || md5Path) {
+      return usage();
+    } else {
+      md5Path = argv[i];
+    }
+  }
+  // A reference that cannot be opened must not turn into a run that compares
+  // nothing and passes.
+  if (md5Path && !(c.md5 = fopen(md5Path, "r"))) {
+    perror(md5Path);
+    return 1;
   }
   FILE* fp = fopen(argv[1], "rb");
   if (!fp) {
@@ -256,97 +307,55 @@ int main(int argc, char** argv) {
     return 1;
   }
   uint8_t hdr[32];
-  if (fread(hdr, 1, 32, fp) != 32 || memcmp(hdr, "DKIF", 4)) {
-    fprintf(stderr, "not IVF\n");
-    return 1;
-  }
+  if (fread(hdr, 1, 32, fp) != 32 || memcmp(hdr, "DKIF", 4))
+    return fail("not IVF");
   int w = hdr[12] | hdr[13] << 8, h = hdr[14] | hdr[15] << 8;
-  // Bound hostile IVF sizes before allocation (matches VCN BS_SIZE).
+  // The largest temporal unit the decoder takes (the BS_SIZE of its session).
+  // An empty one is reported as a damaged file.
   enum { kMaxTuBytes = 0x1800000u };
   size_t cap = 64, cnt = 0;
   uint8_t** tus = malloc(cap * sizeof(*tus));
   size_t* sizes = malloc(cap * sizeof(*sizes));
-  if (!tus || !sizes) {
-    free(tus);
-    free(sizes);
-    fclose(fp);
-    fprintf(stderr, "out of memory\n");
-    return 1;
-  }
+  if (!tus || !sizes) return fail("out of memory");
   uint8_t fh[12];
-  while (fread(fh, 1, 12, fp) == 12) {
+  size_t got;
+  while ((got = fread(fh, 1, 12, fp)) == 12) {
     uint32_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (uint32_t)fh[3] << 24;
     if (!sz || sz > kMaxTuBytes) {
-      fprintf(stderr, "invalid frame size %u\n", sz);
-      for (size_t i = 0; i < cnt; i++) free(tus[i]);
-      free(tus);
-      free(sizes);
-      fclose(fp);
+      fprintf(stderr, "invalid frame size %u at TU %zu\n", sz, cnt);
       return 1;
     }
     if (cnt == cap) {
-      if (cap > SIZE_MAX / 2) {
-        fprintf(stderr, "too many frames\n");
-        for (size_t i = 0; i < cnt; i++) free(tus[i]);
-        free(tus);
-        free(sizes);
-        fclose(fp);
-        return 1;
-      }
+      if (cap > SIZE_MAX / 2 / sizeof(*tus)) return fail("too many frames");
       size_t ncap = cap * 2;
       uint8_t** ntus = realloc(tus, ncap * sizeof(*tus));
-      if (!ntus) {
-        for (size_t i = 0; i < cnt; i++) free(tus[i]);
-        free(tus);
-        free(sizes);
-        fclose(fp);
-        fprintf(stderr, "out of memory\n");
-        return 1;
-      }
+      if (!ntus) return fail("out of memory");
       tus = ntus;
       size_t* nsizes = realloc(sizes, ncap * sizeof(*sizes));
-      if (!nsizes) {
-        for (size_t i = 0; i < cnt; i++) free(tus[i]);
-        free(tus);
-        free(sizes);
-        fclose(fp);
-        fprintf(stderr, "out of memory\n");
-        return 1;
-      }
+      if (!nsizes) return fail("out of memory");
       sizes = nsizes;
       cap = ncap;
     }
     tus[cnt] = malloc(sz);
-    if (!tus[cnt]) {
-      fprintf(stderr, "out of memory reading frame\n");
-      for (size_t i = 0; i < cnt; i++) free(tus[i]);
-      free(tus);
-      free(sizes);
-      fclose(fp);
-      return 1;
-    }
+    if (!tus[cnt]) return fail("out of memory reading a frame");
     if (fread(tus[cnt], 1, sz, fp) != sz) {
-      free(tus[cnt]);
-      break;
+      fprintf(stderr, "truncated frame at TU %zu\n", cnt);
+      return 1;
     }
     sizes[cnt++] = sz;
   }
+  if (got || ferror(fp)) {
+    fprintf(stderr, "error reading %s: the file ends inside a frame header\n",
+            argv[1]);
+    return 1;
+  }
+  fclose(fp);
   if (!cnt) {
     fprintf(stderr, "no frames in %s\n", argv[1]);
-    free(tus);
-    free(sizes);
-    fclose(fp);
     return 1;
   }
   CFDataRef av1C = make_av1C(tus[0], sizes[0]);
-  if (!av1C) {
-    fprintf(stderr, "no sequence header in first TU\n");
-    for (size_t i = 0; i < cnt; i++) free(tus[i]);
-    free(tus);
-    free(sizes);
-    fclose(fp);
-    return 1;
-  }
+  if (!av1C) return fail("no sequence header in first TU");
   const void* ak[] = {CFSTR("av1C")};
   const void* av[] = {av1C};
   CFDictionaryRef atoms =
@@ -372,12 +381,17 @@ int main(int argc, char** argv) {
   CFDictionarySetValue(
       spec, kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder,
       kCFBooleanTrue);
-  if (decoderID) {  // pick one decoder when several handle av01 (e.g. installed
-                    // + -load'ed build)
+  if (decoderID) {
     CFStringRef id =
         CFStringCreateWithCString(NULL, decoderID, kCFStringEncodingUTF8);
+    if (!id) return fail("invalid -id");
     CFDictionarySetValue(spec, CFSTR("DecoderID"), id);
     CFRelease(id);
+  }
+  if (pace > 0) {
+    c.fed = calloc(cnt, sizeof(double));
+    c.lat = calloc(cnt, sizeof(double));
+    if (!c.fed || !c.lat) return fail("out of memory");
   }
   VTDecompressionOutputCallbackRecord cb = {out_cb, &c};
   VTDecompressionSessionRef sess = NULL;
@@ -391,24 +405,14 @@ int main(int argc, char** argv) {
   printf("UsingHardwareAcceleratedVideoDecoder = %s\n",
          hw == kCFBooleanTrue ? "true" : "false");
 
-  if (pace > 0) {
-    c.fed = calloc(cnt, sizeof(double));
-    c.lat = calloc(cnt, sizeof(double));
-    if (!c.fed || !c.lat) {
-      free(c.fed);
-      free(c.lat);
-      c.fed = c.lat = NULL;
-      fprintf(stderr, "out of memory\n");
-      return 1;
-    }
-  }
   double t0 = now_ms();
   for (size_t i = 0; i < cnt; i++) {
     if (pace > 0) {
       double due = t0 + i * 1000.0 / pace;
       while (now_ms() < due) usleep(200);
-      c.fed[i] = due;  // lateness vs. the frame's schedule (a blocking decoder
-                       // delays later frames too)
+      // Lateness is measured against the frame's schedule: a decoder that
+      // blocks delays the later frames too.
+      c.fed[i] = due;
     }
     CMBlockBufferRef bb = NULL;
     CMBlockBufferCreateWithMemoryBlock(NULL, tus[i], sizes[i], kCFAllocatorNull,
@@ -417,7 +421,13 @@ int main(int argc, char** argv) {
     CMSampleTimingInfo ti = {CMTimeMake(1, 30), CMTimeMake((int64_t)i, 30),
                              kCMTimeInvalid};
     size_t ss = sizes[i];
-    CMSampleBufferCreateReady(NULL, bb, fmt, 1, 1, &ti, 1, &ss, &sb);
+    if (bb) CMSampleBufferCreateReady(NULL, bb, fmt, 1, 1, &ti, 1, &ss, &sb);
+    if (!sb) {
+      printf("frame %zu: no sample buffer\n", i);
+      c.errors++;
+      if (bb) CFRelease(bb);
+      continue;
+    }
     VTDecodeInfoFlags info = 0;
     st = VTDecompressionSessionDecodeFrame(
         sess, sb, async ? kVTDecodeFrame_EnableAsynchronousDecompression : 0,

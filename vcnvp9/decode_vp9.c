@@ -1,9 +1,23 @@
-// Decodes a VP9 file on the VCN and prints the I420 MD5 of every shown frame,
-// optionally comparing it with an FFmpeg FATE reference (tests/ref/fate/vp9-*).
+// decode_vp9: decodes a VP9 file (IVF or WebM) on the VCN, without
+// VideoToolbox, and prints the MD5 of every shown frame as I420. With a
+// reference in the format of FFmpeg's FATE suite (tests/ref/fate/vp9-*) it
+// compares each frame.
+//
 // usage: decode_vp9 file [reference] [-v] [-n frames] [-b] [-png dir every]
-//   -b    benchmark: reads no pixels, prints decode speed and the process
-//   footprint -png  writes every Nth shown frame as a half size PNG, for files
-//   that have no reference
+//   -v    prints what the decoder session does
+//   -n    stops after that many container frames
+//   -b    benchmark: reads no pixels, prints decode speed and the memory
+//         footprint of the process
+//   -png  writes every Nth shown frame as a half size PNG into dir, for files
+//         that have no reference
+//
+// It reaches the GPU, so the decoder session refuses to start unless
+// VCNVP9_SESSION=vp9 and VCNVP9_ALLOW_GPU=yes-i-know-it-can-hang are both set.
+// A debugger opens the same gate: only run it under one through
+// tools/dryrun_vp9.py, which stops the process before the kernel.
+//
+// Exit status: 0 = every frame matched, 2 = a frame differs or is missing,
+// 1 = anything else.
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -21,7 +35,7 @@
 #include "vcnvp9.h"
 
 typedef struct {
-  int frames, mismatches, refs_left, png_every;
+  int frames, mismatches, png_every;
   bool bench;
   const char* png_dir;
   FILE* ref;
@@ -45,6 +59,7 @@ static int cmp_float(const void* a, const void* b) {
   return x < y ? -1 : x > y;
 }
 
+// Next frame line of a FATE reference: "stream, dts, pts, duration, size, md5".
 static bool next_ref(Ctx* c, char out[33]) {
   char line[512];
   while (c->ref && fgets(line, sizeof(line), c->ref)) {
@@ -66,6 +81,7 @@ static void write_png(const char* dir, int number, IOSurfaceRef s, uint32_t w,
   size_t ys = IOSurfaceGetBytesPerRowOfPlane(s, 0),
          uvs = IOSurfaceGetBytesPerRowOfPlane(s, 1);
   uint32_t ow = w / 2, oh = h / 2;
+  if (!ow || !oh) return;
   uint8_t* rgb = malloc((size_t)ow * oh * 4);
   if (!rgb) return;
   for (uint32_t r = 0; r < oh; r++)
@@ -96,17 +112,22 @@ static void write_png(const char* dir, int number, IOSurfaceRef s, uint32_t w,
   CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   CGContextRef cg = CGBitmapContextCreate(rgb, ow, oh, 8, (size_t)ow * 4, cs,
                                           kCGImageAlphaNoneSkipLast);
-  CGImageRef img = CGBitmapContextCreateImage(cg);
+  CGImageRef img = cg ? CGBitmapContextCreateImage(cg) : NULL;
   CFURLRef url = CFURLCreateFromFileSystemRepresentation(
       NULL, (const UInt8*)path, (CFIndex)strlen(path), false);
   CGImageDestinationRef dst =
-      CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+      url && img
+          ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL)
+          : NULL;
   if (dst) {
     CGImageDestinationAddImage(dst, img, NULL);
-    CGImageDestinationFinalize(dst);
+    if (!CGImageDestinationFinalize(dst))
+      fprintf(stderr, "could not write %s\n", path);
     CFRelease(dst);
+  } else {
+    fprintf(stderr, "could not write %s\n", path);
   }
-  CFRelease(url);
+  if (url) CFRelease(url);
   CGImageRelease(img);
   CGContextRelease(cg);
   CGColorSpaceRelease(cs);
@@ -123,14 +144,22 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const VP9Parser* p,
     c->frames++;
     return;
   }
-  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
   if (c->png_dir) {
+    IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
     if (c->frames % c->png_every == 0)
       write_png(c->png_dir, c->frames + 1, s, w, h);
     IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
     c->frames++;
     return;
   }
+  uint8_t* row = malloc((size_t)w * 2 + 16);
+  if (!row) {
+    fprintf(stderr, "out of memory hashing a frame\n");
+    c->frames++;
+    c->mismatches++;
+    return;
+  }
+  IOSurfaceLock(s, kIOSurfaceLockReadOnly, NULL);
   bool ten = IOSurfaceGetPixelFormat(s) == 'x420';
   uint8_t *y = IOSurfaceGetBaseAddressOfPlane(s, 0),
           *uv = IOSurfaceGetBaseAddressOfPlane(s, 1);
@@ -139,11 +168,6 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const VP9Parser* p,
   CC_MD5_CTX m;
   CC_MD5_Init(&m);
   uint32_t cw = (w + 1) / 2, ch = (h + 1) / 2;
-  uint8_t* row = malloc((size_t)w * 2 + 16);
-  if (!row) {
-    IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
-    return;
-  }
   for (uint32_t r = 0; r < h; r++) {
     if (ten) {
       uint16_t *src = (uint16_t*)(y + r * ys), *dst = (uint16_t*)row;
@@ -171,10 +195,14 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const VP9Parser* p,
   char hex[33], expect[33] = "";
   for (int i = 0; i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", dg[i]);
   c->frames++;
-  bool have = next_ref(c, expect), ok = !have || !strcmp(expect, hex);
+  // With a reference, a frame the reference does not list is a mismatch too:
+  // otherwise a wrong or empty reference file would pass.
+  bool have = next_ref(c, expect);
+  bool ok = c->ref ? have && !strcmp(expect, hex) : true;
   if (!ok) c->mismatches++;
   printf("frame %3d %ux%u %s%s%s\n", c->frames, w, h, hex,
-         have ? (ok ? "  OK" : "  MISMATCH expected ") : "", ok ? "" : expect);
+         c->ref ? (ok ? "  OK" : "  MISMATCH expected ") : "",
+         ok ? "" : (have ? expect : "(reference ended)"));
 }
 
 static int parse_int_arg(const char* text, int minimum, int* out) {
@@ -187,6 +215,15 @@ static int parse_int_arg(const char* text, int minimum, int* out) {
   return 0;
 }
 
+static int usage(void) {
+  fprintf(stderr,
+          "usage: decode_vp9 file [reference] [-v] [-n frames] [-b] [-png "
+          "dir every]\n"
+          "Reaches the GPU only with VCNVP9_SESSION=vp9 and "
+          "VCNVP9_ALLOW_GPU=yes-i-know-it-can-hang.\n");
+  return 1;
+}
+
 int main(int argc, char** argv) {
   const char *path = NULL, *ref = NULL;
   int limit = 0, exit_code = 1;
@@ -194,7 +231,6 @@ int main(int argc, char** argv) {
   Container f = {0};
   VcnVP9* d = NULL;
   float* times = NULL;
-  bool container_ready = false;
 
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "-v")) {
@@ -216,29 +252,22 @@ int main(int argc, char** argv) {
         fprintf(stderr, "-png interval must be a positive integer\n");
         return 1;
       }
+    } else if (argv[i][0] == '-') {
+      return usage();
     } else if (!path) {
       path = argv[i];
     } else if (!ref) {
       ref = argv[i];
     } else {
-      fprintf(stderr,
-              "usage: decode_vp9 file [reference] [-v] [-n frames] [-b] [-png "
-              "dir every]\n");
-      return 1;
+      return usage();
     }
   }
-  if (!path) {
-    fprintf(stderr,
-            "usage: decode_vp9 file [reference] [-v] [-n frames] [-b] [-png "
-            "dir every]\n");
-    return 1;
-  }
+  if (!path) return usage();
 
   if (!container_open(&f, path)) {
-    fprintf(stderr, "could not read container: %s\n", path);
-    goto done;
+    fprintf(stderr, "%s: %s\n", path, f.problem);
+    return 1;
   }
-  container_ready = true;
   char err[256] = {0};
   double start_fp = footprint_mb();
   d = vcnvp9_create(4096, 2304, err, sizeof(err));
@@ -274,10 +303,6 @@ int main(int argc, char** argv) {
           goto done;
         }
         int new_cap = cap ? cap * 2 : 4096;
-        if ((size_t)new_cap > SIZE_MAX / sizeof(*times)) {
-          fprintf(stderr, "benchmark allocation too large\n");
-          goto done;
-        }
         float* new_times = realloc(times, (size_t)new_cap * sizeof(*times));
         if (!new_times) {
           fprintf(stderr, "out of memory for benchmark samples\n");
@@ -297,6 +322,19 @@ int main(int argc, char** argv) {
       }
     }
   }
+  if (f.problem) {
+    fprintf(stderr, "%s: stopped after chunk %d: %s\n", path, n, f.problem);
+    rc = 1;
+  }
+
+  // A decoder that shows fewer frames than the reference lists must not pass.
+  // With -n the file was cut short on purpose.
+  int missing = 0;
+  char unused[33];
+  if (c.ref && !rc && !limit && !c.bench && !c.png_dir)
+    while (next_ref(&c, unused)) missing++;
+  if (missing)
+    printf("%d reference frame(s) were never decoded  MISSING\n", missing);
 
   double total = now_ms() - t0;
   if (c.bench && timed) {
@@ -304,18 +342,19 @@ int main(int argc, char** argv) {
     printf("bench: %d chunks, %d shown, %.2f s, %.1f shown frames/s\n", timed,
            c.frames, total / 1000, c.frames * 1000.0 / total);
     printf("chunk ms: p50 %.2f p95 %.2f p99 %.2f max %.2f, over 16.67 ms: %d\n",
-           times[timed / 2], times[timed * 95 / 100], times[timed * 99 / 100],
-           times[timed - 1], gt_budget);
+           times[timed / 2], times[(size_t)timed * 95 / 100],
+           times[(size_t)timed * 99 / 100], times[timed - 1], gt_budget);
     printf("footprint MB: before create %.0f, chunk 100 %.0f, end %.0f\n",
            start_fp, first_fp, footprint_mb());
   }
-  printf("%s: %d frames, %d mismatches\n", path, c.frames, c.mismatches);
-  exit_code = rc ? 1 : c.mismatches ? 2 : 0;
+  printf("%s: %d frames, %d mismatches\n", path, c.frames,
+         c.mismatches + missing);
+  exit_code = rc ? 1 : c.mismatches || missing ? 2 : 0;
 
 done:
   free(times);
   vcnvp9_destroy(d);
   if (c.ref) fclose(c.ref);
-  if (container_ready) container_close(&f);
+  container_close(&f);
   return exit_code;
 }

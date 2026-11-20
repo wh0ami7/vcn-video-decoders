@@ -16,6 +16,8 @@ build/
 *.app/
 *.dmg
 /vtvp9/vtvp9test
+/vcnav1/probe_ctx
+/tools/driveruuid
 
 # Reverse-engineering and local test material
 .re/

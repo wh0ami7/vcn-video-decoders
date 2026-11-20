@@ -1,8 +1,17 @@
-// Parser check that needs no driver and no GPU. For every coded frame it walks
-// the tile size markers that follow the headers: they only land exactly on the
-// end of the frame if the uncompressed header parse (sizes, tile layout, header
-// lengths) was right. usage: vp9dump file [-v]
+// vp9dump: checks that the VP9 parser reads a file (IVF or WebM), with no
+// driver and no GPU. Run it on a new clip before decode_vp9 or vtvp9test.
+//
+// For every coded frame it walks the tile size markers that follow the
+// headers: they only land exactly on the end of the frame if the uncompressed
+// header parse (sizes, tile layout, header lengths) was right.
+//
+// usage: vp9dump file [-v]
+//   -v  one line per frame
+//
+// Exit status: 0 = the whole file was read and every tile walk ended on the
+// frame end, 2 = parse error, bad tile walk, or a damaged file.
 #include <stdio.h>
+#include <string.h>
 
 #include "container.h"
 #include "vp9parse.h"
@@ -80,13 +89,13 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
 }
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
+  if (argc < 2 || argv[1][0] == '-') {
     fprintf(stderr, "usage: vp9dump file [-v]\n");
     return 1;
   }
   Container c;
   if (!container_open(&c, argv[1])) {
-    perror(argv[1]);
+    fprintf(stderr, "%s: %s\n", argv[1], c.problem);
     return 1;
   }
   Stats s = {.verbose = argc > 2 && !strcmp(argv[2], "-v")};
@@ -101,6 +110,10 @@ int main(int argc, char** argv) {
       printf("%s: parse error at chunk %d: %s\n", argv[1], chunks, p.err);
       break;
     }
+  }
+  if (c.problem) {
+    printf("%s: stopped after chunk %d: %s\n", argv[1], chunks, c.problem);
+    rc = 1;
   }
   printf(
       "%s: chunks=%d coded=%d shown=%d hidden=%d existing=%d key=%d "
