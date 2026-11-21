@@ -64,8 +64,12 @@ no GPU (see `tests/README.md`).
 macOS's hardware encoder leaves three things wrong on Navi 21: the video engine is never asked for clocks and
 can stay at its lowest speed for a whole recording, no speed preset is ever selected, and every HEVC frame wider
 than 4096 runs a small GPU job with more threads per group than the GPU allows, which stalls it.
-**VCNEncodeFix 1.2.4** fixes all three with a background service (patches the encoder process in memory, no reboot)
+**VCNEncodeFix 1.3.0** fixes all three with a background service (patches the encoder process in memory, no reboot)
 and an optional Lilu kext in the OpenCore EFI (clock floor while encoding). It never touches the system volume.
+From 1.3.0 the same service also lets Continuity Camera (an iPhone as the Mac's camera) and FaceTime calls decode
+the incoming HEVC video on the GPU: it patches each `ContinuityCaptureAgent` and `avconferenced` in memory, in place
+of a `DYLD_INSERT_LIBRARIES` library (details in `vcnencodefix/README.md`). That part is known for VideoProcessing of
+15.8.2 and 26.7.2/26.7.3 only, and was not run with a camera or a call yet; `--no-cc` turns it off.
 
 It is separate from the decoders: the installer shows it in its own collapsed section, with its own checks
 (including an "Access to the encoder process" line) and Install/Remove buttons, and installs nothing unless asked.
@@ -85,7 +89,8 @@ Requirements and behaviour that matter in 1.2.x:
   and would not start on Sequoia); the service log keeps growing after newsyslog rotates it; a service macOS refuses
   access to is logged once instead of four times a second; the package scripts check everything before changing
   anything; the kext sets its clock floor only on chips whose clock levels were read (Navi 21, and Navi 23, which
-  was never run). Details in `vcnencodefix/CHANGELOG.md`.
+  was never run). New in 1.3.0: the Continuity Camera and FaceTime fix (cc); the kext is unchanged except its
+  version string. Details in `vcnencodefix/CHANGELOG.md`.
 
 Results so far: only Tahoe 26.7.3 has been measured on a GPU here (RX 6800 XT, OBS 33) — HEVC 4K60 from 55 %
 repeated frames to 0.3 %, 3840x4320@30 from about 10 fps to real time, 5120x2160@30 from GPU stalls to real time.
@@ -227,12 +232,15 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
   and VP9 4K in hardware through it. Not booted on Sequoia. The old CoreMedia patch for `/Library`
   is gone: it never ran, because Lilu's user-space patcher is off on macOS 11+, so the installer
   writes to `/System`.
-- VCNEncodeFix 1.2.4: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
-  Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures), the floor rule test for 20 AMD
-  device-ids, 23 EFI tests. 1.2.4 was booted on an RX 6800 XT (Tahoe 26.7.3); not run on a Navi 23.
+- VCNEncodeFix 1.3.0: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
+  Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures), the cc test for the VideoProcessing of
+  15.8.2 and 26.7.2/26.7.3 (every altered byte refused, original and patched code run on the CPU, every
+  site found once in a running 26.7.3 and in copies of both builds), the floor rule test for 20 AMD
+  device-ids, 23 EFI tests. The 1.2.4 kext and service were booted on an RX 6800 XT (Tahoe 26.7.3); the
+  cc fix was not run with a camera or a FaceTime call; nothing ran on a Navi 23.
   Full kext package build still needs `KEXT_SDK` (Lilu + MacKernelSDK); without it the installer
-  embeds `vcnencodefix/prebuilt/`. `prebuilt/VCNEncodeFix-1.2.4.zip` was built with
-  `SOURCE_DATE_EPOCH=1795108821`; its kext has the same bytes as the 1.2.4 kext built in DrogaBoxGPU.
+  embeds `vcnencodefix/prebuilt/`. `prebuilt/VCNEncodeFix-1.3.0.zip` was built with
+  `SOURCE_DATE_EPOCH=1795283122`; its kext has the same bytes as the 1.3.0 kext built from the upstream tree.
 
 ## Checking support
 
