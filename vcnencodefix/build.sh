@@ -2,9 +2,9 @@
 # build.sh - builds VCNEncodeFix, runs its tests and packages dist/VCNEncodeFix-<version>.zip.
 #
 # Needs the Command Line Tools and, for the kext, a folder holding Lilu.kext (DEBUG build, it ships the headers and
-# plugin_start.cpp) and MacKernelSDK: KEXT_SDK (or LILU_SDK), default ~/re_cache/work/ryzen_kext_build.
-# The EFI tests use OpenCore's Docs/Sample.plist (OC_SAMPLE, default ~/re_cache/oc_fork/OpenCorePkg/Docs/Sample.plist);
-# they are skipped when it is missing. The last test only reports whether this Mac has the patched Apple files.
+# plugin_start.cpp) and MacKernelSDK: KEXT_SDK (or LILU_SDK), required.
+# The EFI tests use OpenCore's Docs/Sample.plist (OC_SAMPLE, the path to that file); they are skipped when it is
+# not set or missing. The last test only reports whether this Mac has the patched Apple files.
 # CC_IMAGES (VideoProcessing copies taken out of a dyld shared cache, separated by spaces) adds those builds to
 # the cc test.
 #
@@ -17,9 +17,9 @@ setopt err_exit no_unset pipe_fail
 cd "${0:A:h}"
 VERSION=${VERSION_OVERRIDE:-$(<VERSION)}
 export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}
-SDK=${KEXT_SDK:-${LILU_SDK:-~/re_cache/work/ryzen_kext_build}}
-[[ -d $SDK/Lilu.kext && -d $SDK/MacKernelSDK ]] || { print "set KEXT_SDK to a folder holding Lilu.kext and MacKernelSDK"; exit 1; }
-OC_SAMPLE=${OC_SAMPLE:-~/re_cache/oc_fork/OpenCorePkg/Docs/Sample.plist}
+SDK=${KEXT_SDK:-${LILU_SDK:-}}
+[[ -n $SDK && -d $SDK/Lilu.kext && -d $SDK/MacKernelSDK ]] || { print "set KEXT_SDK to a folder holding Lilu.kext and MacKernelSDK"; exit 1; }
+OC_SAMPLE=${OC_SAMPLE:-}
 B=build
 rm -rf $B && mkdir -p $B/kext $B/obj
 
@@ -73,8 +73,8 @@ xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefin
 $B/obj/cc_test ${=CC_IMAGES:-} | tail -1
 xcrun clang++ -std=c++17 -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/floor_test.cpp -o $B/obj/floor_test
 $B/obj/floor_test | tail -1
-if [[ -f $OC_SAMPLE ]]; then zsh tests/efi_test.sh ${B:A}/vcnencodefix $OC_SAMPLE | tail -1
-else print "skipping EFI tests: no OpenCore Sample.plist at $OC_SAMPLE"; fi
+if [[ -n $OC_SAMPLE && -f $OC_SAMPLE ]]; then zsh tests/efi_test.sh ${B:A}/vcnencodefix $OC_SAMPLE | tail -1
+else print "skipping EFI tests: set OC_SAMPLE to OpenCore's Docs/Sample.plist"; fi
 $B/vcnencodefix status > /dev/null && print "status: at least one patch located on this system" || print "status: no patch is available here"
 
 print "== package"
