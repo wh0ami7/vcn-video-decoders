@@ -188,7 +188,8 @@ static Vcn* fake_create(void) {
   if (failCreate) return NULL;
   if (invalidateInCreate) base_invalidate((CMBaseObjectRef)invalidateInCreate);
   creates++;
-  return (Vcn*)calloc(1, sizeof(struct Fake));
+  struct Fake* f = calloc(1, sizeof(*f));
+  return (Vcn*)f;
 }
 static void fake_destroy(Vcn* d) {
   if (__atomic_load_n(&decodesRunning, __ATOMIC_SEQ_CST))

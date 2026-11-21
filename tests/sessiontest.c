@@ -125,14 +125,27 @@ static int f_create_driver(void** out, AVD_DriverCreate* dc) {
   if (((FakeAccel*)dc->accel)->destroyed) st.useAfterDestroy = true;
   if (fault.createDriver) return fault.createDriver;
   FakeDrv* d = calloc(1, sizeof(*d));
+  if (!d) return NULL;
   d->va = calloc(1, 75080);
   d->factory = calloc(1, 16);
+  if (!d->va || !d->factory) {
+    free(d->va);
+    free(d->factory);
+    free(d);
+    return NULL;
+  }
   // One class for every factory, as in the real driver (VAFactory's vtable).
   static void* factoryClass[40];
   *(void**)d->factory = &factoryClass[2];
   *(void**)((uint8_t*)d->va + 75072) = d->factory;
   // the layout vcnvp9.c reads: drv+8 -> VAContext
   void** raw = calloc(2, sizeof(void*));
+  if (!raw) {
+    free(d->va);
+    free(d->factory);
+    free(d);
+    return NULL;
+  }
   raw[1] = fault.noVA ? NULL : d->va;
   // keep FakeDrv reachable from the handle: raw[0]
   raw[0] = d;
@@ -158,8 +171,16 @@ static int f_alloc(void* h, AVD_BitstreamPool* p) {
   if (fault.alloc) return fault.alloc;
   FakeDrv* d = drv_of(h);
   if (p->count != VCN_NUM_BS) return 5;
-  for (int i = 0; i < VCN_NUM_BS; i++)
+  for (int i = 0; i < VCN_NUM_BS; i++) {
     p->addressesOut[i] = d->buffers[i] = calloc(1, kFakeBuffer);
+    if (!d->buffers[i]) {
+      for (int j = 0; j < i; j++) {
+        free(d->buffers[j]);
+        p->addressesOut[j] = d->buffers[j] = NULL;
+      }
+      return 5;
+    }
+  }
   if (fault.nullBuf) {
     free(d->buffers[1]);
     p->addressesOut[1] = d->buffers[1] = NULL;
@@ -246,6 +267,7 @@ static int f_create_accel(AVD_Accelerator** out, AVD_AcceleratorCreate* in,
     return fault.create;
   }
   FakeAccel* a = calloc(1, sizeof(*a));
+  if (!a) return NULL;
   a->a.fn[AVD_FN_CreateDriver] = (void*)f_create_driver;
   a->a.fn[AVD_FN_DeleteDriver] = (void*)f_delete_driver;
   a->a.fn[AVD_FN_CreateContexts] = (void*)f_create_ctx;

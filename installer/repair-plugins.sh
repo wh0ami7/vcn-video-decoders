@@ -25,7 +25,9 @@ HERE=${0:A:h}
 GOOD_SNAP=com.apple.bless.81846B18-5CF0-4A10-B806-1BCA9AF53056   # UUID 117F6397, booted 2026-11-06 afternoon
 RES="$HERE/build/AMD VCN Video Decoders.app/Contents/Resources"
 MNT=/System/Volumes/Update/mnt1
-SNAPMNT=/private/var/tmp/vcn-goodsnap
+# New directory each run: a fixed path under /private/var/tmp can already be
+# mounted by another user and would then serve attacker-controlled "Apple" bundles.
+SNAPMNT=
 REL=System/Library/Video/Plug-Ins
 
 csrutil authenticated-root status | grep -qi disabled || { echo "authenticated-root must be disabled"; exit 1; }
@@ -38,9 +40,12 @@ vol=${snap%s[0-9]*}
 [[ "$vol" == /dev/disk*s* ]] || { echo "could not determine system volume (got '$vol')"; exit 1; }
 echo "system volume: $vol"
 
-mkdir -p "$MNT" "$SNAPMNT"
+mkdir -p "$MNT"
 mount | grep -q " on $MNT " || mount -o nobrowse -t apfs "$vol" "$MNT"
-mount | grep -q " on $SNAPMNT " || mount_apfs -s "$GOOD_SNAP" -o rdonly,nobrowse "$vol" "$SNAPMNT"
+SNAPMNT=$(mktemp -d /private/var/tmp/vcn-goodsnap.XXXXXX) \
+  || { echo "could not make a mount point for the good snapshot"; exit 1; }
+mount_apfs -s "$GOOD_SNAP" -o rdonly,nobrowse "$vol" "$SNAPMNT" \
+  || { rmdir "$SNAPMNT"; echo "could not mount good snapshot"; exit 1; }
 
 SRC="$SNAPMNT/$REL"
 DST="$MNT/$REL"
@@ -80,6 +85,7 @@ done
 echo "final Plug-Ins:"; ls -1 "$DST" | sed 's/^/   /'
 
 umount "$SNAPMNT" || true
+rmdir "$SNAPMNT" 2>/dev/null || true
 bless --folder "$MNT/System/Library/CoreServices" --bootefi --create-snapshot
 echo
 echo "OK: Apple plug-ins restored + AV1/VP9 decoders installed. Reboot now."

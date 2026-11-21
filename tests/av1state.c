@@ -132,6 +132,7 @@ int main(int argc, char** argv) {
 
   // Reference: the original temporal unit.
   AV1Parser* p = calloc(1, sizeof(*p));
+  if (!p) return 1;
   av1_parser_init(p);
   Seen want = {0};
   expect("the first temporal unit parses",

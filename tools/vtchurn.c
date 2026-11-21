@@ -207,13 +207,25 @@ int main(int argc, char** argv) {
   int w = hdr[12] | hdr[13] << 8, h = hdr[14] | hdr[15] << 8;
   uint8_t** data = calloc((size_t)k + 1, sizeof(*data));
   size_t* sizes = calloc((size_t)k + 1, sizeof(*sizes));
+  if (!data || !sizes) {
+    free(data);
+    free(sizes);
+    fclose(fp);
+    fprintf(stderr, "out of memory\n");
+    return 1;
+  }
   long have = 0;
   uint8_t fh[12];
-  while (data && sizes && have < k && fread(fh, 1, 12, fp) == 12) {
+  while (have < k && fread(fh, 1, 12, fp) == 12) {
     uint32_t sz = fh[0] | fh[1] << 8 | fh[2] << 16 | (uint32_t)fh[3] << 24;
     if (!sz || sz > 0x1800000u || !(data[have] = malloc(sz)) ||
         fread(data[have], 1, sz, fp) != sz) {
       fprintf(stderr, "%s: damaged frame %ld\n", clip, have);
+      for (long i = 0; i < have; i++) free(data[i]);
+      free(data[have]);
+      free(data);
+      free(sizes);
+      fclose(fp);
       return 1;
     }
     sizes[have++] = sz;
@@ -221,6 +233,9 @@ int main(int argc, char** argv) {
   fclose(fp);
   if (have < k) {
     fprintf(stderr, "%s: only %ld frames\n", clip, have);
+    for (long i = 0; i < have; i++) free(data[i]);
+    free(data);
+    free(sizes);
     return 1;
   }
 

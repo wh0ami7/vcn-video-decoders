@@ -1,12 +1,16 @@
 # macOS
 .DS_Store
 
-# Local analysis tooling
+# Local analysis / agent tooling
 .codegraph/
 graphify-out/
 bin/
+.serena/
+.grok/*
+!.grok/skills/
+!.grok/plugins/
 
-# Build products
+# Build products (any module)
 build/
 /vcnencodefix/dist/
 *.o
@@ -15,10 +19,27 @@ build/
 *.dSYM/
 *.app/
 *.dmg
-/vtvp9/vtvp9test
+*.kext/
+
+# Decoder / test binaries written next to sources (not under build/)
+/vcnav1/decode_ivf
 /vcnav1/probe_ctx
+/vcnvp9/decode_vp9
+/vcnvp9/vp9dump
+/vtav1/vtav1test
+/vtvp9/vtvp9test
 /tools/driveruuid
 /tools/vtchurn
+/tools/poollayout
+
+# Encodefix local outputs
+/vcnencodefix/reports/
+/vcnencodefix/scripts/reports/
+/vcnencodefix/scripts/bin/
+
+# CPU test suite downloads and binaries
+/tests/media/
+/tests/build/
 
 # Reverse-engineering and local test material
 .re/
@@ -27,7 +48,16 @@ build/
 *.webm
 *.md5
 
-# Editors
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / clangd
 .vscode/
 .idea/
+.compile_commands.json
+compile_commands.json
+.cache/
 artifacts/
