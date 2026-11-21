@@ -3,16 +3,22 @@
 // Applies two patches inside every VTEncoderXPCService (the process where macOS
 // runs hardware video encoders):
 //   preset  AMDRadeonVADriver2: the VCN encoder gets a speed (or
-//   balance/quality) preset on every frame wide    AppleGVAHEVCEncoder: HEVC
-//   encodes wider than 4096 no longer hang the GPU's compute channel
+//           balance/quality) preset on every frame
+//   wide    AppleGVAHEVCEncoder: HEVC encodes wider than 4096 no longer hang
+//           the GPU's compute channel
+// and one inside every ContinuityCaptureAgent (an iPhone used as a camera) and
+// avconferenced (FaceTime calls), the processes that decode video calls:
+//   cc      VideoProcessing: the incoming HEVC stream is decoded by the GPU
+//           instead of the CPU
 // See patches.c for what each patch changes. The bytes are written into the
 // target the way a debugger writes a breakpoint: the page is made copy-on-write
 // in that process only and the process is suspended for the write. Nothing on
 // disk changes; a patched process keeps the patch until it exits.
 //
-// The driver lives in the dyld shared cache, mapped at the same address in
-// every process, so its site is found once in this process. The HEVC plug-in is
-// a file that each service loads with dlopen when its first HEVC session is
+// The driver and VideoProcessing live in the dyld shared cache, mapped at the
+// same address in every process, so their sites are found once in this
+// process (and their bytes are checked again in each target). The HEVC plug-in
+// is a file that each service loads with dlopen when its first HEVC session is
 // created, at its own address. A new service is found within about 10 ms of its
 // launch, its dyld image list is then watched every 10 ms while the plug-in is
 // not loaded yet, and the plug-in is patched as soon as it appears (in OBS the
@@ -93,6 +99,14 @@ static struct {
 static struct {
   bool enabled, available;
   char reason[200];
+  const CcBuild* build;     // the validated build of VideoProcessing
+  uint64_t site[kCcSites];  // same address in every process
+  uint8_t repl[kCcSites][kCcMaxWrite];
+} gCc;
+
+static struct {
+  bool enabled, available;
+  char reason[200];
   uuid_t uuid;
   const WideBuild* build;   // the validated build of the plug-in on disk
   uint64_t callVm, caveVm;  // image addresses before the slide
@@ -157,7 +171,7 @@ static bool sip_blocks_access(void) {
 }
 static const char* kSipHint =
     "SIP Debugging Restrictions are on, so macOS refuses access to the "
-    "encoder; "
+    "encoder and the video-call processes; "
     "add 0x4 to csr-active-config (see README, Requirements)";
 
 static int parse_preset(const char* s, uint32_t* op) {
@@ -220,32 +234,43 @@ static size_t count_matches(const uint8_t* hay, size_t n, const uint8_t* needle,
   return m;
 }
 
-static void locate_preset(void) {
-  gPreset.available = false;
+// Address in this process of an image of the dyld shared cache (0 if it is not
+// in the cache, -1 if there is no cache), its UUID and the cache's slide (the
+// image's load commands hold unslid addresses).
+static uint64_t cache_image(const char* path, char uuidStr[40],
+                            uint64_t* slideOut) {
   size_t len = 0;
   const uint8_t* base = _dyld_get_shared_cache_range(&len);
   uuid_t cache;
   if (!base || memcmp(base, "dyld_v1", 7) != 0 ||
-      !_dyld_get_shared_cache_uuid(cache)) {
-    snprintf(gPreset.reason, sizeof(gPreset.reason), "no dyld shared cache");
-    return;
-  }
+      !_dyld_get_shared_cache_uuid(cache))
+    return (uint64_t)-1;
   uint32_t mappingOffset;
   memcpy(&mappingOffset, base + 16, 4);
   uint64_t unslidBase;
   memcpy(&unslidBase, base + mappingOffset, 8);
   uint64_t slide = (uint64_t)base - unslidBase;
   __block uint64_t unslid = 0;
-  char uuidStr[40] = "";
-  char* uuidOut = uuidStr;
   dyld_shared_cache_iterate_text(
       cache, ^(const struct dyld_shared_cache_dylib_text_info* info) {
-        if (info->path && !strcmp(info->path, kPresetImage)) {
+        if (info->path && !strcmp(info->path, path)) {
           unslid = info->loadAddressUnslid;
-          uuid_unparse_upper(info->dylibUuid, uuidOut);
+          uuid_unparse_upper(info->dylibUuid, uuidStr);
         }
       });
-  if (!unslid) {
+  *slideOut = slide;
+  return unslid ? unslid + slide : 0;
+}
+
+static void locate_preset(void) {
+  gPreset.available = false;
+  char uuidStr[40] = "";
+  uint64_t slide = 0, addr = cache_image(kPresetImage, uuidStr, &slide);
+  if (addr == (uint64_t)-1) {
+    snprintf(gPreset.reason, sizeof(gPreset.reason), "no dyld shared cache");
+    return;
+  }
+  if (!addr) {
     snprintf(
         gPreset.reason, sizeof(gPreset.reason),
         "AMDRadeonVADriver2 is not in the shared cache (no AMD GPU driver?)");
@@ -257,7 +282,7 @@ static void locate_preset(void) {
              "AMDRadeonVADriver2 build %s is not a validated build", uuidStr);
     return;
   }
-  const struct mach_header_64* mh = (const void*)(unslid + slide);
+  const struct mach_header_64* mh = (const void*)addr;
   const struct section_64* text = macho_text(mh, 65536, NULL);
   if (!text) {
     snprintf(gPreset.reason, sizeof(gPreset.reason),
@@ -275,6 +300,38 @@ static void locate_preset(void) {
   gPreset.site = text->addr + slide + at;
   build_preset(gPreset.repl, gPreset.op);
   gPreset.available = true;
+}
+
+static void locate_cc(void) {
+  gCc.available = false;
+  char uuidStr[40] = "";
+  uint64_t slide = 0, addr = cache_image(kCcImage, uuidStr, &slide);
+  if (addr == (uint64_t)-1 || !addr) {
+    snprintf(gCc.reason, sizeof(gCc.reason), "%s",
+             addr ? "no dyld shared cache"
+                  : "VideoProcessing is not in the shared cache");
+    return;
+  }
+  const CcBuild* b = cc_build(uuidStr);
+  if (!b) {
+    snprintf(gCc.reason, sizeof(gCc.reason),
+             "VideoProcessing build %s is not a validated build", uuidStr);
+    return;
+  }
+  const struct section_64* text = macho_text((const void*)addr, 65536, NULL);
+  if (!text) {
+    snprintf(gCc.reason, sizeof(gCc.reason), "VideoProcessing: no __text");
+    return;
+  }
+  char why[160];
+  if (!cc_locate(b, (const uint8_t*)(text->addr + slide), text->size,
+                 text->addr + slide, gCc.site, why, sizeof(why))) {
+    snprintf(gCc.reason, sizeof(gCc.reason), "VideoProcessing: %s", why);
+    return;
+  }
+  gCc.build = b;
+  for (int k = 0; k < kCcSites; k++) build_cc(&b->site[k], gCc.repl[k]);
+  gCc.available = true;
 }
 
 static void locate_wide(void) {
@@ -572,6 +629,88 @@ static int do_wide(task_t task, bool remove, char* msg, size_t len) {
   return 0;
 }
 
+// State of both cc sites in a target: kOriginal / kPatched when both are,
+// kOther when any site holds other bytes (or they disagree), kUnreadable.
+static State cc_state(task_t task, int st[kCcSites]) {
+  bool unreadable = false;
+  int orig = 0, patched = 0, written = 0;
+  for (int k = 0; k < kCcSites; k++) {
+    const CcSite* s = &gCc.build->site[k];
+    uint8_t cur[kCcMaxFind], tgt[kCcTgtLen];
+    if (!rd(task, gCc.site[k], cur, s->len) ||
+        (s->tgtLen && !rd(task, gCc.site[k] + s->tgtDist, tgt, s->tgtLen))) {
+      unreadable = true;
+      st[k] = -2;
+      continue;
+    }
+    st[k] = cc_site_state(s, cur, tgt);
+    if (st[k] < 0) return kOther;
+    if (s->n) {
+      written++;
+      orig += st[k] == 0;
+      patched += st[k] == 1;
+    }
+  }
+  if (unreadable) return kUnreadable;
+  if (orig == written) return kOriginal;
+  if (patched == written) return kPatched;
+  return kOther;  // some patched, some not: not written by this tool
+}
+
+// Like do_preset, for a video-call process.
+static int do_cc(task_t task, bool remove, char* msg, size_t len) {
+  int st[kCcSites];
+  State s = cc_state(task, st);
+  if (s == kUnreadable) {
+    snprintf(msg, len, "cc: not readable yet");
+    return 1;
+  }
+  if (s == kOther) {
+    snprintf(msg, len, "cc: %s (sites K %d, A %d, B %d), left alone",
+             state_str(s), st[0], st[1], st[2]);
+    return -1;
+  }
+  if ((remove && s == kOriginal) || (!remove && s == kPatched)) {
+    snprintf(msg, len, "cc: already %s", remove ? "original" : "patched");
+    return 0;
+  }
+  Region r[kCcSites];
+  int nr = 0;
+  for (int k = 0; k < kCcSites; k++) {
+    const CcSite* c = &gCc.build->site[k];
+    if (c->n)
+      r[nr++] = (Region){gCc.site[k] + c->off, c->n,
+                         remove ? c->find + c->off : gCc.repl[k]};
+  }
+  char err[160];
+  if (write_regions(task, r, nr, err, sizeof(err)) != 0) {
+    snprintf(msg, len, "cc: %s", err);
+    return -1;
+  }
+  snprintf(msg, len,
+           remove ? "cc: restored"
+                  : "cc: patched (video-call decoders without DecoderUsage)");
+  return 0;
+}
+
+// ContinuityCaptureAgent or avconferenced; *name = its file name.
+static bool agent_path(pid_t pid, const char** name) {
+  char path[PROC_PIDPATHINFO_MAXSIZE];
+  if (proc_pidpath(pid, path, sizeof(path)) <= 0) return false;
+  for (int i = 0; kCcTargets[i]; i++)
+    if (!strcmp(path, kCcTargets[i])) {
+      if (name) *name = strrchr(kCcTargets[i], '/') + 1;
+      return true;
+    }
+  return false;
+}
+static bool is_agent(pid_t pid) { return agent_path(pid, NULL); }
+static const char* agent_name(pid_t pid) {
+  const char* n = "video-call process";
+  agent_path(pid, &n);
+  return n;
+}
+
 static bool is_service(pid_t pid) {
   char path[PROC_PIDPATHINFO_MAXSIZE];
   return proc_pidpath(pid, path, sizeof(path)) > 0 &&
@@ -604,8 +743,8 @@ static bool parse_long(const char* s, long* out) {
   return true;
 }
 
-// The encoder service processes; NULL with *count 0 when listing fails.
-static pid_t* list_services(int* count) {
+// The processes `is` accepts; NULL with *count 0 when listing fails.
+static pid_t* list_pids(int* count, bool (*is)(pid_t)) {
   *count = 0;
   int n = proc_listallpids(NULL, 0);
   if (n < 0) return NULL;
@@ -614,17 +753,21 @@ static pid_t* list_services(int* count) {
   n = proc_listallpids(pids, (n + 256) * (int)sizeof(pid_t));
   int k = 0;
   for (int i = 0; i < n; i++)
-    if (is_service(pids[i])) pids[k++] = pids[i];
+    if (is(pids[i])) pids[k++] = pids[i];
   *count = k;
   return pids;
 }
+static pid_t* list_services(int* count) { return list_pids(count, is_service); }
+static pid_t* list_agents(int* count) { return list_pids(count, is_agent); }
 
-static void setup(bool preset, uint32_t op, bool wide) {
+static void setup(bool preset, uint32_t op, bool wide, bool cc) {
   gPreset.enabled = preset;
   gPreset.op = op;
   gWide.enabled = wide;
+  gCc.enabled = cc;
   locate_preset();
   locate_wide();
+  locate_cc();
 }
 
 // ---- commands ----
@@ -645,6 +788,13 @@ static int cmd_status(void) {
         gWide.callVm, gWide.caveVm);
   else
     printf("  wide    unavailable  %s\n", gWide.reason);
+  if (gCc.available)
+    printf(
+        "  cc      %-12s Continuity Camera and FaceTime HEVC on the GPU "
+        "(VideoProcessing sites 0x%llx, 0x%llx)\n",
+        gCc.enabled ? "available" : "off", gCc.site[1], gCc.site[2]);
+  else
+    printf("  cc      unavailable  %s\n", gCc.reason);
   if (sip_blocks_access())
     printf("  access  REFUSED      %s\n", kSipHint);
   else
@@ -677,12 +827,35 @@ static int cmd_status(void) {
   }
   if (!n) printf("  no encoder service running\n");
   free(pids);
-  return (gPreset.available || gWide.available) ? 0 : 3;
+  if (gCc.available) {
+    pids = list_agents(&n);
+    for (int i = 0; i < n; i++) {
+      task_t task;
+      if (task_for_pid(mach_task_self(), pids[i], &task) != KERN_SUCCESS) {
+        printf("  %s pid %d: %s\n", agent_name(pids[i]), pids[i],
+               sip_blocks_access() ? "access refused by SIP"
+                                   : "run with sudo to see its state");
+        continue;
+      }
+      int st[kCcSites];
+      printf("  %s pid %d: cc %s\n", agent_name(pids[i]), pids[i],
+             state_str(cc_state(task, st)));
+      mach_port_deallocate(mach_task_self(), task);
+    }
+    if (!n)
+      printf(
+          "  no ContinuityCaptureAgent or avconferenced running (they start "
+          "with the camera or a call)\n");
+    free(pids);
+  }
+  return (gPreset.available || gWide.available || gCc.available) ? 0 : 3;
 }
 
 static int cmd_one(pid_t pid, bool remove) {
-  if (!is_service(pid)) {
-    fprintf(stderr, "pid %d is not %s\n", pid, kServicePath);
+  bool agent = is_agent(pid);
+  if (!agent && !is_service(pid)) {
+    fprintf(stderr, "pid %d is not %s, %s or %s\n", pid, kServicePath,
+            kCcTargets[0], kCcTargets[1]);
     return 1;
   }
   task_t task;
@@ -695,6 +868,17 @@ static int cmd_one(pid_t pid, bool remove) {
   }
   int fails = 0;
   char msg[300];
+  if (agent) {
+    if (!gCc.enabled || !gCc.available) {
+      logf_("pid %d: cc: %s", pid, gCc.enabled ? gCc.reason : "off");
+      fails++;
+    } else {
+      fails += do_cc(task, remove, msg, sizeof(msg)) != 0;
+      logf_("pid %d: %s", pid, msg);
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return fails ? 1 : 0;
+  }
   if (gPreset.enabled && gPreset.available) {
     fails += do_preset(task, remove, msg, sizeof(msg)) != 0;
     logf_("pid %d: %s", pid, msg);
@@ -769,6 +953,67 @@ static void consider(pid_t pid, bool preset, bool wide) {
   logf_("pid %d: %s", pid, line);
   gSvc[freeSlot] = (Svc){pid, st, wr == 1, pr == 1, 0, gTick + 500};
 }
+// Video-call processes (ContinuityCaptureAgent, started with the camera, and
+// avconferenced, which keeps running between calls): patched once each, the
+// first time they are seen (pid and start time), so a relaunched one is
+// patched again. VideoProcessing is in the shared cache, so its sites can be
+// written before the process loads it; one whose memory cannot be read yet
+// (right after exec) is retried every tick for up to 5 s. The patch acts on
+// the next decoder the process creates.
+enum { kMaxAgent = 64 };
+static struct {
+  pid_t pid;
+  uint64_t start;
+  bool pending;
+  unsigned until;
+} gAgent[kMaxAgent];
+static void consider_agent(pid_t pid) {
+  uint64_t st = start_time(pid);
+  int freeSlot = -1;
+  for (int k = 0; k < kMaxAgent; k++) {
+    if (gAgent[k].pid == pid && gAgent[k].start == st) return;
+    if (freeSlot < 0 && gAgent[k].pid == 0) freeSlot = k;
+  }
+  if (freeSlot < 0) return;
+  task_t task;
+  kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+  if (kr != KERN_SUCCESS) {
+    logf_("pid %d (%s): task_for_pid failed (%s)%s", pid, agent_name(pid),
+          mach_error_string(kr),
+          sip_blocks_access() ? ": SIP Debugging Restrictions are on" : "");
+    gAgent[freeSlot].pid = pid;  // not asked again while it runs
+    gAgent[freeSlot].start = st;
+    gAgent[freeSlot].pending = false;
+    return;
+  }
+  char msg[300];
+  int r = do_cc(task, false, msg, sizeof(msg));
+  mach_port_deallocate(mach_task_self(), task);
+  if (r != 1) logf_("pid %d (%s): %s", pid, agent_name(pid), msg);
+  gAgent[freeSlot].pid = pid;
+  gAgent[freeSlot].start = st;
+  gAgent[freeSlot].pending = r == 1;
+  gAgent[freeSlot].until = gTick + 500;
+}
+static void retry_agents(unsigned tick) {
+  for (int k = 0; k < kMaxAgent; k++) {
+    if (!gAgent[k].pid || !gAgent[k].pending) continue;
+    task_t task;
+    if (task_for_pid(mach_task_self(), gAgent[k].pid, &task) != KERN_SUCCESS) {
+      gAgent[k].pending = false;
+      continue;
+    }
+    char msg[300];
+    int r = do_cc(task, false, msg, sizeof(msg));
+    mach_port_deallocate(mach_task_self(), task);
+    if (r != 1 || tick > gAgent[k].until) {
+      logf_("pid %d (%s): %s%s", gAgent[k].pid, agent_name(gAgent[k].pid), msg,
+            r == 1 ? ", gave up after 5 s" : "");
+      gAgent[k].pending = false;
+    }
+  }
+}
+
 // launchd starts an XPC service in a fork of itself (path /sbin/launchd for
 // about 1 ms), which execs xpcproxy, which execs the service binary about 11 ms
 // later (seen with every core loaded). A new pid caught in one of those two
@@ -793,11 +1038,15 @@ static void remember_new(pid_t pid, unsigned tick) {
       return;
     }
 }
-static void check_new(unsigned tick, bool preset, bool wide) {
+static void check_new(unsigned tick, bool preset, bool wide, bool cc) {
   for (int k = 0; k < kMaxNew; k++) {
     if (!gNew[k].pid) continue;
-    if (is_service(gNew[k].pid)) {
-      consider(gNew[k].pid, preset, wide);
+    bool svc = (preset || wide) && is_service(gNew[k].pid);
+    if (svc || (cc && is_agent(gNew[k].pid))) {
+      if (svc)
+        consider(gNew[k].pid, preset, wide);
+      else
+        consider_agent(gNew[k].pid);
       gNew[k].pid = 0;
     } else if (tick > gNew[k].until || !is_spawning(gNew[k].pid))
       gNew[k].pid = 0;
@@ -811,7 +1060,8 @@ static int cmd_watch(unsigned intervalMs) {
   os_line(os, sizeof(os));
   logf_("vcnencodefix %s started on %s", VERSION, os);
   bool preset = gPreset.enabled && gPreset.available,
-       wide = gWide.enabled && gWide.available;
+       wide = gWide.enabled && gWide.available,
+       cc = gCc.enabled && gCc.available;
   if (!gPreset.enabled)
     logf_("preset: off");
   else
@@ -822,7 +1072,11 @@ static int cmd_watch(unsigned intervalMs) {
   else
     logf_(wide ? "wide: active%s" : "wide: unavailable, %s",
           wide ? "" : gWide.reason);
-  if (!preset && !wide) {
+  if (!gCc.enabled)
+    logf_("cc: off");
+  else
+    logf_(cc ? "cc: active%s" : "cc: unavailable, %s", cc ? "" : gCc.reason);
+  if (!preset && !wide && !cc) {
     logf_("nothing to do on this system; exiting");
     return 0;
   }  // 0: launchd does not restart it
@@ -859,8 +1113,10 @@ static int cmd_watch(unsigned intervalMs) {
            i++) {  // merge walk: pids in cur but not in prev
         while (j < prevN && prev[j] < cur[i]) j++;
         if (tick > 0 && (j >= prevN || prev[j] != cur[i])) {
-          if (is_service(cur[i]))
+          if ((preset || wide) && is_service(cur[i]))
             consider(cur[i], preset, wide);
+          else if (cc && is_agent(cur[i]))
+            consider_agent(cur[i]);
           else if (is_spawning(cur[i]))
             remember_new(cur[i], tick);
         }
@@ -870,17 +1126,30 @@ static int cmd_watch(unsigned intervalMs) {
       cur = t;
       prevN = n;
     }
-    check_new(tick, preset, wide);
+    check_new(tick, preset, wide, cc);
     if (tick % ticksPerScan == 0) {
       for (int k = 0; k < kMaxSvc; k++)  // forget services that exited
         if (gSvc[k].pid && (kill(gSvc[k].pid, 0) != 0 ||
                             start_time(gSvc[k].pid) != gSvc[k].start))
           gSvc[k].pid = 0;
+      for (int k = 0; k < kMaxAgent; k++)  // and agents
+        if (gAgent[k].pid && (kill(gAgent[k].pid, 0) != 0 ||
+                              start_time(gAgent[k].pid) != gAgent[k].start))
+          gAgent[k].pid = 0;
       int sn;
-      pid_t* pids = list_services(&sn);
-      for (int i = 0; i < sn; i++) consider(pids[i], preset, wide);
-      free(pids);
+      pid_t* pids;
+      if (preset || wide) {
+        pids = list_services(&sn);
+        for (int i = 0; i < sn; i++) consider(pids[i], preset, wide);
+        free(pids);
+      }
+      if (cc) {
+        pids = list_agents(&sn);
+        for (int i = 0; i < sn; i++) consider_agent(pids[i]);
+        free(pids);
+      }
     }
+    if (cc) retry_agents(tick);
     for (int k = 0; k < kMaxSvc;
          k++) {  // services found before their memory was ready, or waiting for
                  // the plug-in
@@ -928,7 +1197,9 @@ static int cmd_watch(unsigned intervalMs) {
   }
   free(prev);
   free(cur);
-  logf_("stopped (services already patched keep the patch until they exit)");
+  logf_(
+      "stopped (processes already patched keep the patch "
+      "until they exit)");
   return 0;
 }
 
@@ -937,13 +1208,14 @@ static void usage(void) {
           "vcnencodefix %s\n"
           "usage:\n"
           "  vcnencodefix status                           what can be patched "
-          "here, and each encoder service's state\n"
+          "here, and the state of each process it patches\n"
           "  vcnencodefix patch <pid> [options]            patch one "
-          "VTEncoderXPCService (root)\n"
+          "VTEncoderXPCService, ContinuityCaptureAgent or avconferenced "
+          "(root)\n"
           "  vcnencodefix unpatch <pid> [options]          restore the "
-          "original bytes in one service (root)\n"
+          "original bytes in one of them (root)\n"
           "  vcnencodefix watch [options] [--interval MS]  patch every encoder "
-          "service that starts (root; the daemon)\n"
+          "service and video-call process that starts (root; the daemon)\n"
           "  vcnencodefix efi-add <config.plist>           add "
           "VCNEncodeFloor.kext to OpenCore's Kernel > Add (backup first)\n"
           "  vcnencodefix efi-remove <config.plist>        remove it again "
@@ -952,7 +1224,7 @@ static void usage(void) {
           "entry is there (read-only)\n"
           "  vcnencodefix version\n"
           "options: --preset speed|balance|quality (default speed), "
-          "--no-preset, --no-wide\n",
+          "--no-preset, --no-wide, --no-cc\n",
           VERSION);
 }
 
@@ -975,7 +1247,7 @@ int main(int argc, char** argv) {
     }
     return efi_command(cmd + 4, argv[2]);
   }
-  bool preset = true, wide = true;
+  bool preset = true, wide = true, cc = true;
   uint32_t op = kPresetSpeed;
   unsigned interval = 250;
   pid_t pid = 0;
@@ -1006,6 +1278,8 @@ int main(int argc, char** argv) {
       preset = false;
     else if (!strcmp(argv[i], "--no-wide"))
       wide = false;
+    else if (!strcmp(argv[i], "--no-cc"))
+      cc = false;
     else if (!strcmp(argv[i], "--interval") && i + 1 < argc) {
       long v;
       if (!parse_long(argv[++i], &v)) {
@@ -1018,7 +1292,7 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  setup(preset, op, wide);
+  setup(preset, op, wide, cc);
   if (!strcmp(cmd, "status")) return cmd_status();
   if (!strcmp(cmd, "watch")) {
     logFollow();

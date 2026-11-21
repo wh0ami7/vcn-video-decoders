@@ -5,6 +5,8 @@
 # plugin_start.cpp) and MacKernelSDK: KEXT_SDK (or LILU_SDK), default ~/re_cache/work/ryzen_kext_build.
 # The EFI tests use OpenCore's Docs/Sample.plist (OC_SAMPLE, default ~/re_cache/oc_fork/OpenCorePkg/Docs/Sample.plist);
 # they are skipped when it is missing. The last test only reports whether this Mac has the patched Apple files.
+# CC_IMAGES (VideoProcessing copies taken out of a dyld shared cache, separated by spaces) adds those builds to
+# the cc test.
 #
 # VERSION_OVERRIDE=<x.y.z> builds with another version string (to compare a build with a released one).
 #
@@ -65,11 +67,15 @@ print "== tests"
 xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
   tests/wide_test.c tests/run_block.s tool/patches.c -o $B/obj/wide_test
 $B/obj/wide_test | tail -1
+# CC_IMAGES: optional VideoProcessing copies (taken out of a dyld shared cache) whose sites are checked too
+xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+  tests/cc_test.c tests/run_cc.s tool/patches.c -framework VideoToolbox -o $B/obj/cc_test
+$B/obj/cc_test ${=CC_IMAGES:-} | tail -1
 xcrun clang++ -std=c++17 -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/floor_test.cpp -o $B/obj/floor_test
 $B/obj/floor_test | tail -1
 if [[ -f $OC_SAMPLE ]]; then zsh tests/efi_test.sh ${B:A}/vcnencodefix $OC_SAMPLE | tail -1
 else print "skipping EFI tests: no OpenCore Sample.plist at $OC_SAMPLE"; fi
-$B/vcnencodefix status > /dev/null && print "status: both patches located on this system" || print "status: not every patch is available here"
+$B/vcnencodefix status > /dev/null && print "status: at least one patch located on this system" || print "status: no patch is available here"
 
 print "== package"
 # assembled under another name; it replaces the old package only when everything worked

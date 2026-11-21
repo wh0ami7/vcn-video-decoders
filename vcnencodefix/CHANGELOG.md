@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.3.0 (not released)
+
+- New service fix, *cc*: the incoming HEVC video of Continuity Camera and FaceTime calls decoded by the GPU
+  instead of the CPU, in every `ContinuityCaptureAgent` and `avconferenced`. Both decode through AVConference
+  (`VideoDecoder_NewFormat_InitDecoder`), which puts `DecoderUsage = 1` in the decoder specification itself before
+  VideoProcessing's VCPDec adds it again; with it AppleGVA takes its FaceTime path and the AMD driver refuses
+  ("[HEVC] GVA ERROR: Couldn't set the stream resolution"). Patched: VCPDec's own removal of that key before the
+  hardware decoder (restored for the software retry) runs for every codec, not only for other codecs on some
+  board-ids, and `VCPDecompressionSessionSetProperty` drops the same key as a property with Apple's own check for
+  it. Builds: VideoProcessing of 15.8.2 (24H232) and 26.7.2/26.7.3 (25G332/25G342, the same file). The site
+  bytes and the jumps are checked per build; any other build stays off. Read in IDA on both builds (AVConference
+  too); the call targets confirmed on 26.7.3 in a live process. Not run with a camera or a call: an interpose
+  library that drops the same key gave a hardware decoder at 60 fps on an RX 6900 XT (15.8.2, Continuity Camera).
+- `--no-cc` (service and `install.sh`) turns it off; `patch` / `unpatch <pid>` take those processes too;
+  `status` shows the cc line and each of them running.
+- `tests/cc_test.c`: for each build, the lookup refuses every single-byte change, a second copy, a B whose key
+  load is not K's and an A that removes another slot; the state reader leaves altered bytes alone; the original
+  and patched code run on the CPU with the calls recorded. With this Mac's own build (and any `CC_IMAGES` copies)
+  it also finds every site once in the real file and checks the key and the call targets.
+- The shared-cache lookup used by *preset* is shared with *cc*; *preset* is unchanged.
+- The kext's code is unchanged; only its version string says 1.3.0. A 1.2.4 kext on the EFI can stay (no reboot
+  needed), although `install/encoder.sh check` reports the new version as an update.
+
 ## 1.2.4 (not released)
 
 - The kext sets the clock floor only on chips whose video clock levels were read, so the

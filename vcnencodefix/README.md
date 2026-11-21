@@ -27,16 +27,26 @@ Measured on an RX 6800 XT, macOS 26.7.3, OBS 33.0.1 (HEVC, 30 s recordings):
 In OBS, "skipped frames due to encoding lag" means OBS re-sent the previous picture because the encoder was busy:
 the file has every frame, but those are duplicates. That number is the one to watch.
 
+From 1.3.0 the service also fixes one decoding problem:
+
+| Problem | What you see | Fixed by |
+|---|---|---|
+| Continuity Camera (an iPhone used as the Mac's camera) and FaceTime calls ask for the "FaceTime" HEVC decoder, which the AMD driver refuses | the video works, but the HEVC stream is decoded by the CPU; the log shows `[HEVC] GVA ERROR: Couldn't set the stream resolution` | **vcnencodefix** service (*cc*) |
+
+The cc fix was checked in IDA and with CPU tests on 15.8.2 and 26.7.3, but **not yet run with a real camera or call** (see
+Limitations).
+
 ## Requirements
 
 - A Navi 21 GPU (device ID 0x73A0-0x73AF or 0x73BF). Only an RX 6800 XT has been tested.
 - macOS **14.8.9 (23J631)**, **15.8.2 (24H232)**, **15.8.3 (24H241)** or **26.7.3 (25G342)**. Only 26.7.3 has been run
   on a GPU; the others were checked in IDA (same code and offsets) and with the CPU test of the wide patch. Every part
   checks the exact build of the Apple file it changes and stays off on any other build, so a macOS update cannot break
-  anything; it only switches the fix off until a new version supports it.
+  anything; it only switches the fix off until a new version supports it. The cc fix knows the VideoProcessing of
+  **15.8.2** and **26.7.2/26.7.3** only; on 14.8.9 and 15.8.3 it stays off (`status` prints the build it found).
 - OpenCore with **Lilu 1.7.0 or newer** (for the kext).
 - For the service: **SIP Debugging Restrictions** off (bit `0x4`, `CSR_ALLOW_TASK_FOR_PID`,
-  in `csr-active-config`). The service patches Apple's encoder process the way a debugger
+  in `csr-active-config`). The service patches Apple's encoder process (and the video-call processes) the way a debugger
   does, and macOS refuses that even to root while this restriction is on: the log then
   shows `task_for_pid failed ((os/kern) failure)` and `vcnencodefix status` says
   `access REFUSED`. Check with `csrutil status`. To change it in OpenCore:
@@ -81,7 +91,7 @@ Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into th
 
 ### Versions of the two halves
 
-The service and the kext never talk to each other, so any 1.2.x service works with any 1.2.x kext: updating the
+The service and the kext never talk to each other, so any 1.2.x or 1.3.x service works with any 1.2.x kext: updating the
 service alone is fine (the service 1.1.0 was installed and tested on the GPU here while the kext was still 1.0.1). A new
 kext only takes effect after a reboot, and every change to its code (1.2.4 is one) has to be booted once before it
 counts as tested.
@@ -94,8 +104,19 @@ counts as tested.
 ./test.sh --wide     # adds one 5120x2160 HEVC encode (only runs if the fix is confirmed active)
 ```
 
-A healthy doctor output shows `VCNEncodeFloor: loaded <version>, active: encode`, the service `running`, and both
-`preset` and `wide` as `available`.
+A healthy doctor output shows `VCNEncodeFloor: loaded <version>, active: encode`, the service `running`, and
+`preset`, `wide` and `cc` as `available`.
+
+To check the cc fix: start the iPhone camera in any app, or a FaceTime video call, then
+
+```
+grep -E "ContinuityCaptureAgent|avconferenced" /var/log/vcnencodefix.log | tail -4   # "cc: patched (...)"
+/usr/bin/log show --last 3m --predicate 'eventMessage CONTAINS "VCPDec" OR eventMessage CONTAINS "GVA"' | grep -E "Created|unsuccesful|GVA ERROR"
+```
+
+`Created HW video decoder` is the fix working; `Creating HW decoder was unsuccesful` or `[HEVC] GVA ERROR: Couldn't
+set the stream resolution` followed by a software decoder means it did not. FaceTime picks HEVC or H.264 with the
+other side; only HEVC had the problem (the decoder line names the codec).
 
 ## Uninstall
 
@@ -110,7 +131,10 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
 
 - `sudo ./install.sh --preset balance` (or `quality`): a slower preset with better quality per bit than `speed`.
   The default `speed` is the one measured above; the others were not measured.
-- `sudo ./install.sh --no-wide` or `--no-preset`: install with one of the two service fixes off.
+- `sudo ./install.sh --no-wide`, `--no-preset` or `--no-cc`: install with that service fix off (they combine).
+- One process only: `sudo /usr/local/libexec/vcnencodefix unpatch <pid>` puts Apple's bytes back in that
+  ContinuityCaptureAgent or avconferenced (`patch <pid>` writes them again). It takes effect for the next decoder
+  the process creates.
 - Boot arguments for the kext: `-vcnflooroff` turns it off; `-vcnfloorall` also applies the floor to hardware
   *decoding* (not tested); `vcnfloor=N` replaces the floor value the kext requests (default 132297; 0 is ignored;
   only the default was measured); `-vcnfloordbg` and `-vcnfloorbeta` are Lilu's usual debug and newer-macOS
@@ -129,6 +153,14 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   - *wide*: just before the statistics job is sent to the GPU, the work is split into more, smaller thread groups
     (for example 2 x 160 threads instead of 1 x 320 for 5120 wide). The total work is the same, and below 4097 pixels
     wide nothing changes at all.
+  - *cc*: for every `ContinuityCaptureAgent` (started when an app opens an iPhone camera) and `avconferenced`
+    (FaceTime's call daemon, always running), two changes in its copy of VideoProcessing. Both decode the other
+    side's video through AVConference and VideoProcessing's VCPDec, and both put `DecoderUsage = 1` in the decoder
+    specification, which sends AppleGVA down its FaceTime path that the AMD driver refuses. Apple's own code already
+    removes that key right before the hardware decoder (and puts it back for the software retry), but only for
+    other codecs on some board-ids; the patch makes that removal run for every codec. The same key sent later as a
+    session property is dropped too, by Apple's own check for it, which has the same limit. No setting avoids it:
+    the `FaceTimeDecoder` preference only flips a flag. Every other process keeps Apple's code.
 
   Before writing, it checks that the file is the validated build, that the bytes to change are exactly the expected
   ones, and that no thread is running them at that moment.
@@ -149,6 +181,14 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   the GPU for a few seconds (version 1.0.0 looked for new processes only every 250 ms and lost that race in OBS at
   5120x2160).
 - HEVC Main only (as macOS itself on these cards). Sizes accepted by macOS are unchanged.
+- The cc fix was **not run with a real camera or FaceTime call** here. It removes the same key that an interpose
+  library removed in a Continuity Camera test on an RX 6900 XT (15.8.2): that test gave `Created HW video decoder`
+  at 60 fps. FaceTime was never tested, with or without it. The patch itself was checked in IDA (VideoProcessing,
+  and AVConference to find who adds the key), by finding every site once in each validated build (and in this
+  Mac's running 26.7.3), and by running the original and patched code on the CPU with the calls recorded. A
+  process already running when the service starts is patched then, and the fix applies to the next decoder it
+  creates (the next call, or stop and start the camera). H.264 also loses the key before the hardware decoder,
+  as it already does on Mac Pro and iMac Pro board-ids.
 - The wide fix was checked by running its exact code on the CPU for every width up to 16384 (arguments identical
   to the original up to 4096 wide, the same total work above), and on the GPU at 5120x2160 only. Other widths above
   4096 were not encoded, and whether rate control behaves exactly as below 4096 was not checked.
@@ -166,6 +206,8 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   the validated ones; the kext stays off.
 - `waiting for AMDRadeonX6000HWLibs or AMDRadeonX6800HWLibs` stays after boot: neither Navi 21 power library loaded,
   so the GPU is not a Navi 21 driven by macOS's AMD driver.
+- `cc unavailable: VideoProcessing build ... is not a validated build`: the cc fix does not know this macOS
+  build yet; the encoder fixes are not affected.
 - The service log is full of `task_for_pid failed ((os/kern) failure)` and nothing gets patched: SIP's Debugging
   Restrictions are on (see Requirements). From 1.2.2 the line ends with ": SIP Debugging Restrictions are on" and
   `./doctor.sh` shows `access REFUSED`.
