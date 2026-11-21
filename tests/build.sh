@@ -37,4 +37,7 @@ for c in av1 vp9; do
     ../vcncommon/vcnsession.c -framework CoreFoundation -framework CoreVideo \
     -framework IOKit -framework IOSurface -o "${B}/sessiontest-${c}"
 done
+# The loader kext's decisions (vcnvtkext/allow_logic.hpp), in a normal program.
+xcrun clang++ -std=c++17 "${TFLAGS[@]}" -I../vcnvtkext loadertest.cpp \
+  -o "${B}/loadertest"
 echo "built the tests in tests/${B}"

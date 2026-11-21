@@ -110,7 +110,7 @@ Details, limits and the command-line install are in `vcnencodefix/README.md`. Ve
 | `vtvp9/` | `VP9VCNDecoder.bundle`, the VideoToolbox plug-in for `vp09`. `vtvp9test` drives it through the public VT API |
 | `installer/` | The graphical installer app and its shell engine. See `installer/README.md` |
 | `vcnencodefix/` | The optional encoding fix (VCNEncodeFix): kext, service, scripts, tests. `prebuilt/` holds the built package the installer embeds |
-| `vcnvtkext/` | Lilu kext to load the plug-ins from `/Library` instead of `/System`. Experimental, see Status |
+| `vcnvtkext/` | VCNVTLoader: Lilu kext that lets Safari load the plug-ins when AMFIPass or the boot-arg don't. Optional, see its README |
 | `vcnprofilekext/` | Lilu kext that switches the GPU to the VIDEO workload profile. Measurement tool, see Status |
 | `tools/` | Reverse-engineering helpers (lldb dry runs, symbol and struct tools). They need Apple binaries that are not included |
 | `webtest/` | Local test pages for MSE and mediaCapabilities. The test videos are not included |
@@ -154,11 +154,10 @@ KEXT_SDK=/path/to/sdk ./vcnvtkext/build.sh
 `KEXT_SDK` must contain `Lilu.kext` (a build that ships `Contents/Resources/Headers` and `Library`)
 and a `MacKernelSDK` checkout.
 
-`vcnvtkext` allows the two plug-ins by cdhash. `vcnvtkext/build.sh` runs `gen_cdhashes.sh` first,
-which rewrites `cdhashes.h` from `vtav1/build/` and `vtvp9/build/`: build both plug-ins first, and
-build the kext again whenever a plug-in is rebuilt. The checked-in `cdhashes.h` is from an
-earlier build of the plug-ins; the script overwrites it, and it only matches the exact bundles it
-was made from (see the cdhash note below).
+`vcnvtkext` allows the two plug-ins by cdhash. `vcnvtkext/build.sh` makes the list when it builds,
+from `vtav1/build/` and `vtvp9/build/` (built first if missing), `vcnvtkext/released-builds.txt` and
+any bundle named on its command line. Build the kext again whenever a plug-in is rebuilt; for a
+release, list the DMG's bundles (see `vcnvtkext/README.md`).
 
 VCNEncodeFix builds the same way (`KEXT_SDK=/path/to/sdk ./vcnencodefix/build.sh`, writes
 `vcnencodefix/dist/`), and `build-app.sh` prefers that build. Without it, `build-app.sh` uses the checked-in
@@ -224,8 +223,10 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
 - `vcnprofilekext`: the firmware accepted the VIDEO profile, but speed and power didn't change.
 - Decoders 0.3.3: built and checked on the CPU only (`tests/run.sh`, against a made-up driver).
   Not run on a GPU yet.
-- `vcnvtkext`: the AMFI part works. The CoreMedia patch doesn't land on Tahoe because Lilu can't
-  patch the split dyld shared cache, so the installer writes to `/System` instead.
+- `vcnvtkext` (VCNVTLoader 1.1.0): booted on Tahoe 26.7.3 with AMFIPass off; Safari played AV1
+  and VP9 4K in hardware through it. Not booted on Sequoia. The old CoreMedia patch for `/Library`
+  is gone: it never ran, because Lilu's user-space patcher is off on macOS 11+, so the installer
+  writes to `/System`.
 - VCNEncodeFix 1.2.4: wide-patch CPU unit test passes for the Tahoe 26.7.3, Sequoia 15.8.2/15.8.3 and
   Sonoma 14.8.9 plug-in builds (1025 widths each, 0 failures), the floor rule test for 20 AMD
   device-ids, 23 EFI tests. 1.2.4 was booted on an RX 6800 XT (Tahoe 26.7.3); not run on a Navi 23.

@@ -15,11 +15,11 @@
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
-	<key>CFBundleVersion</key>
-	<string>1.0.0</string>
+	<string>__VERSION__</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>VCNVTLoader</key>

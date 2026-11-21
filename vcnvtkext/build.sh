@@ -2,64 +2,124 @@
 # zsh is required: this is a macOS installer/build script. Google Shell
 # Style permits a non-bash interpreter when the execution environment
 # forces it (https://google.github.io/styleguide/shellguide.html).
-# Build VCNVTLoader.kext (a Lilu plugin). Toolchain flags follow the standard Lilu-plugin
-# kernel build; this is validated on the first real compile (after the CoreMedia patch bytes
-# are filled in kern_coremedia.cpp). Needs the Command Line Tools.
-set -e
-cd "${0:A:h}"
-SDK=${KEXT_SDK:?"set KEXT_SDK to a folder holding Lilu.kext (DEBUG build, it ships the headers) and MacKernelSDK"}
-LILU_HDR="$SDK/Lilu.kext/Contents/Resources"              # so <Headers/...> resolves
-LILU_LIB="$SDK/Lilu.kext/Contents/Resources/Library"     # plugin_start.cpp lives here
-MKSDK="$SDK/MacKernelSDK"
+#
+# build.sh - builds vcnvtkext/build/VCNVTLoader.kext, the kext that lets the decoder
+# plug-ins load on a Mac without AMFIPass. It installs nothing.
+#
+#   vcnvtkext/build.sh                 allow the two plug-ins in vtav1/build and vtvp9/build
+#   vcnvtkext/build.sh <bundle> ...    allow these bundles too (for example the release DMG's)
+#
+# The kext only lets through the exact plug-in builds listed in it. The list is made here,
+# from three places:
+#   1. vtav1/build/AV1VCNDecoder.bundle and vtvp9/build/VP9VCNDecoder.bundle (built first
+#      if missing)
+#   2. released-builds.txt in this folder: the builds of published releases
+#   3. any bundle given on the command line
+# So a kext and the plug-ins built from the same tree always match. Rebuild the kext after
+# rebuilding the plug-ins: a changed plug-in has a new hash, and the old kext refuses it.
+#
+# Needs the Command Line Tools, Lilu.kext (DEBUG build, it ships the headers) and
+# MacKernelSDK: KEXT_SDK=<folder holding both>, as for vcnencodefix, or LILU_KEXT and
+# MACKERNELSDK one by one.
+#
+# The kext carries its build date (Lilu's version string). It is taken from
+# SOURCE_DATE_EPOCH, which defaults to the date of the last commit, so the same commit and
+# the same list always give the same kext.
+emulate -L zsh
+setopt err_exit no_unset pipe_fail
+HERE=${0:A:h}
+ROOT=${HERE:h}
 NAME=VCNVTLoader
-OUT=build
-rm -rf "$OUT" && mkdir -p "$OUT/$NAME.kext/Contents/MacOS"
+VERSION=$(<$HERE/VERSION)
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git -C $ROOT log -1 --format=%ct 2>/dev/null || date +%s)}
+LILU=${LILU_KEXT:-${KEXT_SDK:-}/Lilu.kext}
+MKSDK=${MACKERNELSDK:-${KEXT_SDK:-}/MacKernelSDK}
+[[ -f $LILU/Contents/Resources/Library/plugin_start.cpp && -f $MKSDK/Library/x86_64/libkmod.a ]] || {
+  print "Lilu.kext (DEBUG) and MacKernelSDK not found: set KEXT_SDK, or LILU_KEXT and MACKERNELSDK"; exit 1; }
 
-./gen_cdhashes.sh
+AV1=$ROOT/vtav1/build/AV1VCNDecoder.bundle
+VP9=$ROOT/vtvp9/build/VP9VCNDecoder.bundle
+B=$HERE/build
+OBJ=$B/obj
+FINAL=$B/$NAME.kext
+OUT=$OBJ/$NAME.kext  # assembled here; it replaces $FINAL only when everything worked
+[[ -d $AV1 ]] || $ROOT/vtav1/build.sh
+[[ -d $VP9 ]] || $ROOT/vtvp9/build.sh
+rm -rf $OBJ && mkdir -p $OBJ $OUT/Contents/MacOS
 
-CXX=(xcrun clang++)
-FLAGS=(
-  -std=c++17 -target x86_64-apple-macos10.15
-  -fapple-kext -mkernel -nostdlib -nostdinc++
-  -DMODULE_VERSION=1.0.0 "-DPRODUCT_NAME=$NAME"
-  -I. -I"$LILU_HDR" -I"$MKSDK/Headers"
-  -Oz -flto=thin -fno-exceptions -fno-rtti
-  -Wall -Wextra -Wno-unused-parameter
-)
-SRC=( kern_start.cpp kern_amfi.cpp kern_coremedia.cpp "$LILU_LIB/plugin_start.cpp" )
-
-OBJ=()
-for s in $SRC; do
-  o="$OUT/$(basename ${s%.cpp}).o"
-  "${CXX[@]}" $FLAGS -c "$s" -o "$o"
-  OBJ+=("$o")
+# The list. Each entry: 40 hex digits and a label.
+cdhash() {  # cdhash <bundle>: the hash AMFI compares (20 bytes) for the x86_64 code, or nothing
+  { codesign -dvvv --arch x86_64 $1 2>&1 || true; } | sed -n 's/^CDHash=\([0-9a-f]\{40\}\)$/\1/p'
+}
+# A label goes into a comment of the generated header: keep only harmless characters.
+clean() { print -rn -- "$1" | LC_ALL=C tr -c 'A-Za-z0-9 ._-' '_'; }
+typeset -A seen
+entries=()
+add() {  # add <hash> <label>
+  [[ $1 == [0-9a-f](#c40) ]] || { print "not a code directory hash: '$1' ($2)"; exit 1; }
+  [[ -n ${seen[$1]:-} ]] && return 0
+  seen[$1]=1
+  entries+=("$1 $(clean "$2")")
+}
+setopt extended_glob
+for bundle in $AV1 $VP9 "$@"; do
+  [[ -d $bundle ]] || { print "no such bundle: $bundle"; exit 1; }
+  h=$(cdhash $bundle || true)
+  [[ -n $h ]] || { print "$bundle is not signed (not even ad-hoc), so it has no hash to list"; exit 1; }
+  add $h "${bundle:t:r} $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' $bundle/Contents/Info.plist 2>/dev/null || true)"
 done
+# "|| [[ -n $h ]]": a last line with no newline at its end is still read.
+while read -r h label || [[ -n $h ]]; do
+  [[ -z $h || $h == \#* ]] && continue
+  add $h "$label"
+done < $HERE/released-builds.txt
 
-# kmod_info glue. Xcode normally generates this from the MODULE_START/MODULE_STOP
-# build settings; a manual clang/ld build must emit it, or the kext has no kmod_info
-# and the kernel cannot start it (it loads but never runs). This defines _kmod_info and
-# wires libkmod's _start/_stop -> _realmain/_antimain -> our Lilu plugin entry points.
-cat > "$OUT/kmod_info.c" <<EOF
-#include <mach/mach_types.h>
+{
+  print "// Generated by vcnvtkext/build.sh. Do not edit."
+  print "#include <stddef.h>"
+  print "#include <stdint.h>"
+  print "static const uint8_t kAllowedCdhashes[][20] = {"
+  for e in $entries; do
+    h=${e%% *}
+    print -r -- "    // ${e#* }"
+    print "    {$(print -r -- $h | sed -E 's/(..)/0x\1, /g; s/, $//')},"
+  done
+  print "};"
+  # Counted by the compiler from the rows above, and checked against the list made here.
+  print "static const size_t kAllowedCdhashCount = sizeof(kAllowedCdhashes) / sizeof(kAllowedCdhashes[0]);"
+  print "static_assert(sizeof(kAllowedCdhashes) / sizeof(kAllowedCdhashes[0]) == ${#entries}, \"list\");"
+} > $OBJ/cdhashes.h
+
+KFLAGS=(-std=c++17 -target x86_64-apple-macos10.15 -fapple-kext -mkernel -nostdlib -nostdinc++
+        -DMODULE_VERSION=$VERSION -DPRODUCT_NAME=$NAME -DLILU_CUSTOM_IOKIT_INIT
+        -I$HERE -I$OBJ -isystem "$LILU/Contents/Resources" -I"$MKSDK/Headers"
+        -Oz -flto=thin -fno-exceptions -fno-rtti -Wall -Wno-unused-parameter)
+objs=()
+for src in $HERE/kern_start.cpp $HERE/kern_amfi.cpp $HERE/kern_service.cpp \
+           "$LILU/Contents/Resources/Library/plugin_start.cpp"; do
+  o=$OBJ/${src:t:r}.o
+  xcrun clang++ $KFLAGS -c $src -o $o
+  objs+=($o)
+done
+# A manual clang/ld build has to emit kmod_info itself, or the kext loads but never runs.
+print -r -- '#include <mach/mach_types.h>
 #include <mach/kmod.h>
-extern kern_return_t ${NAME}_kern_start(kmod_info_t *, void *);
-extern kern_return_t ${NAME}_kern_stop(kmod_info_t *, void *);
+extern kern_return_t '$NAME'_kern_start(kmod_info_t *, void *);
+extern kern_return_t '$NAME'_kern_stop(kmod_info_t *, void *);
 extern kern_return_t _start(kmod_info_t *, void *);
 extern kern_return_t _stop(kmod_info_t *, void *);
-KMOD_EXPLICIT_DECL(com.droga.${NAME}, "1.0.0", _start, _stop)
-__private_extern__ kmod_start_func_t *_realmain = ${NAME}_kern_start;
-__private_extern__ kmod_stop_func_t *_antimain = ${NAME}_kern_stop;
-EOF
-xcrun clang -target x86_64-apple-macos10.15 -fapple-kext -mkernel -nostdlib \
-  -I"$MKSDK/Headers" -Oz -c "$OUT/kmod_info.c" -o "$OUT/kmod_info.o"
-OBJ+=("$OUT/kmod_info.o")
+KMOD_EXPLICIT_DECL(com.droga.'$NAME', "'$VERSION'", _start, _stop)
+__private_extern__ kmod_start_func_t *_realmain = '$NAME'_kern_start;
+__private_extern__ kmod_stop_func_t *_antimain = '$NAME'_kern_stop;' > $OBJ/kmod_info.c
+xcrun clang -target x86_64-apple-macos10.15 -mkernel -nostdlib -I"$MKSDK/Headers" -Oz \
+  -c $OBJ/kmod_info.c -o $OBJ/kmod_info.o
+xcrun ld -kext -arch x86_64 -platform_version macos 10.15 10.15 -L"$MKSDK/Library/x86_64" -lkmod \
+  $objs $OBJ/kmod_info.o -o $OUT/Contents/MacOS/$NAME
+sed "s/__VERSION__/$VERSION/g" $HERE/Info.plist > $OUT/Contents/Info.plist
+plutil -lint -s $OUT/Contents/Info.plist
+codesign -f -s - $OUT 2>/dev/null
+[[ "$(nm $OUT/Contents/MacOS/$NAME)" == *' D _kmod_info'* ]] || { print "kmod_info missing"; exit 1; }
+rm -rf $FINAL && mv $OUT $FINAL
 
-# Link as a kext: Lilu KPI + kernel KPIs come from MacKernelSDK's kmod library.
-xcrun ld -kext -arch x86_64 \
-  -platform_version macos 10.15 10.15 \
-  -L"$MKSDK/Library/x86_64" -lkmod \
-  "${OBJ[@]}" -o "$OUT/$NAME.kext/Contents/MacOS/$NAME"
-
-cp Info.plist "$OUT/$NAME.kext/Contents/Info.plist"
-codesign -f -s - "$OUT/$NAME.kext"
-echo "built $OUT/$NAME.kext"
+print "built vcnvtkext/build/$NAME.kext ($VERSION), allowing ${#entries} plug-in builds:"
+for e in $entries; do print "  ${e%% *}  ${e#* }"; done

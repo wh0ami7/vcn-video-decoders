@@ -75,6 +75,7 @@ check "installer/validated-builds.json agrees with the decoders' driver lists" \
   lists
 check "only AMD's accelerator is taken" "${B}/acceltest"
 check "a decode command that never finishes times out" "${B}/waittest"
+check "the loader kext lets through only the listed plug-ins" "${B}/loadertest"
 sessions() {
   "${B}/sessiontest-av1" media/av1/av1-1-b8-01-size-16x16.ivf \
     > "${B}/sessiontest-av1.txt" &&

@@ -52,7 +52,7 @@ backup and is checked after the edit). **Remove** undoes the same scope.
 
 VideoToolbox scans `/System/Library/Video/Plug-Ins` without a code-signature check. `/Library/Video/Plug-Ins`
 requires an Apple signature, and patching that check out of CoreMedia at runtime is not possible on
-Tahoe: Lilu's userspace patcher cannot patch the split dyld shared cache (see `../vcnvtkext`).
+macOS 11 and later: Lilu's user-space patcher is switched off there.
 
 ## For developers
 
