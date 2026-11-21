@@ -78,14 +78,15 @@ check "a decode command that never finishes times out" "${B}/waittest"
 check "the loader kext lets through only the listed plug-ins" "${B}/loadertest"
 sessions() {
   "${B}/sessiontest-av1" media/av1/av1-1-b8-01-size-16x16.ivf \
-    > "${B}/sessiontest-av1.txt" &&
+    media/av1/av1-1-b8-05-mv.ivf > "${B}/sessiontest-av1.txt" &&
     "${B}/sessiontest-vp9" media/vp9/vp90-2-12-droppable_1.ivf \
+      media/vp9-invalid/invalid-vp90-2-09-aq2.webm.ivf.s3984_r01-05_b6-.ivf \
       > "${B}/sessiontest-vp9.txt" ||
     { cat "${B}/sessiontest-av1.txt" "${B}/sessiontest-vp9.txt" 2>/dev/null |
         grep -v ^PASS; return 1; }
 }
 check "decoder sessions release the driver once, also after failures and a \
-stuck GPU (made-up driver)" sessions
+stuck GPU; hidden frames keep their picture (made-up driver)" sessions
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"
