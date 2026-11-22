@@ -212,14 +212,39 @@ system_volume() {
   fi
 }
 
+MOUNTED_HERE=0
 mount_system() {
   local vol
   vol=$(system_volume) || return 1
   echo "system volume $vol -> $MNT"
   mkdir -p "$MNT"
-  mount | grep -q " on $MNT " || mount -o nobrowse -t apfs "$vol" "$MNT" || return 1
+  if ! mount | grep -q " on $MNT "; then
+    mount -o nobrowse -t apfs "$vol" "$MNT" || return 1
+    MOUNTED_HERE=1
+  fi
   [[ -d "$MNT/System/Library/CoreServices" ]] \
     || { echo "$MNT does not look like a system volume" >&2; return 1; }
+}
+
+# Unmount the writable system volume if this run mounted it. A mount that was already there
+# belongs to someone else and stays.
+release_system() {
+  [[ $MOUNTED_HERE -eq 1 ]] || return 0
+  MOUNTED_HERE=0
+  umount "$MNT" 2>/dev/null || echo "note: $MNT is still mounted; it goes away at reboot" >&2
+}
+
+# Bless a new snapshot of the edited volume and unmount it. If bless fails, the Mac boots the
+# same snapshot as before, so what was just done does not take effect at reboot, even though
+# the live volume was changed: say so and fail, so the app does not report success.
+bless_snapshot() { # what (for the message)
+  echo "blessing new snapshot..."
+  if ! bless --folder "$MNT/System/Library/CoreServices" --bootefi --create-snapshot; then
+    echo "bless failed: the Mac keeps booting the current snapshot, so $1 does not take effect at reboot. The live system volume was already changed; run this again before rebooting." >&2
+    release_system
+    return 1
+  fi
+  release_system
 }
 
 # Put back every Apple plug-in missing from DST, copied from the pristine SRC (Apple's sealed
@@ -279,8 +304,7 @@ do_repair() {
   else
     echo "driver build not validated: decoders NOT installed (Apple plug-ins repaired only)"
   fi
-  echo "blessing new snapshot..."
-  bless --folder "$MNT/System/Library/CoreServices" --bootefi --create-snapshot || exit 1
+  bless_snapshot "the repair" || exit 1
   echo "OK: reboot to apply"
 }
 
@@ -338,8 +362,7 @@ do_install() {
     || { echo "system Plug-Ins folder looks damaged; not touching it" >&2; exit 4; }
   install_one "$RES/$AV1" "$AV1" || exit 1
   install_one "$RES/$VP9" "$VP9" || exit 1
-  echo "blessing new snapshot..."
-  bless --folder "$MNT/System/Library/CoreServices" --bootefi --create-snapshot
+  bless_snapshot "the install" || exit 1
   echo "OK: reboot to load the decoders"
 }
 
@@ -350,7 +373,7 @@ do_uninstall() {
   safe_rm_bundle "$MNT/$PLUGDIR/$AV1" || exit 1
   safe_rm_bundle "$MNT/$PLUGDIR/$VP9" || exit 1
   echo "removed both bundles"
-  bless --folder "$MNT/System/Library/CoreServices" --bootefi --create-snapshot
+  bless_snapshot "the uninstall" || exit 1
   echo "OK: reboot to apply"
 }
 
