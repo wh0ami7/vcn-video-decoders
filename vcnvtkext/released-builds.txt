@@ -6,4 +6,5 @@
 # Take a line out when that build should no longer load, for example after a security fix.
 # Labels may hold letters, digits, spaces, dots, dashes and underscores.
 #
-# No release has been listed yet.
+539103c584fa1152524de16b1d9c14ffd5366229 AV1VCNDecoder 0.3.3 release 1.1.2
+f64f35a1093a7ff9563711686b052de17d6bbf49 VP9VCNDecoder 0.3.3 release 1.1.2

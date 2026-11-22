@@ -35,6 +35,26 @@ decode messages and submit them through the driver, then hand the frames back to
 VP9 is not in Apple's driver at all. `vcnvp9` builds the VCN VP9 messages itself, following the
 same layout as Mesa's `ac_vcn_dec.h`.
 
+## Decoders 0.3.4
+
+- The VP9 plug-in now declares a rating (`VTRating` 400 in its `CMMatchingInfo`, the value Apple
+  gives its own hardware decoders). With an Intel iGPU of the Kaby Lake or Ice Lake families
+  active next to the Radeon, macOS also offers Apple's Intel VP9 decoder (`AppleGVAVPXDecoder`,
+  which needs the iGPU's `IOGVAXDecode` key). Both declared the same codec, hardware flag and
+  version, and VideoToolbox breaks such a tie by an internal hash order that put Apple's first.
+  On a UHD 630 + RX 6800 XT it decoded one frame and stalled, and our plug-in never got the
+  video (issue #5).
+- How VideoToolbox orders candidates, read with IDA in VideoToolbox of Tahoe 26.7.x and Sequoia
+  15.8.2: GPU preference, the Apple-internal flag, then `VTRating` (missing counts as 0), then
+  the hardware flag. Checked through the real selection code with two stand-in decoders: with
+  the rating ours is tried first. If ours fails to start, VideoToolbox still falls back to
+  Apple's. Macs without such an iGPU see no change.
+- The AV1 plug-in only moves to 0.3.4 with it: macOS has no Apple AV1 hardware decoder.
+- `vcnvtkext/released-builds.txt` now lists the two plug-ins of release 1.1.2, so a loader built
+  from this tree still accepts them.
+
+Not run on a Mac with an Intel iGPU.
+
 ## Decoders 0.3.3
 
 The two plug-ins report version 0.3.3 (they were 0.1). What changed since 0.1, in short:
