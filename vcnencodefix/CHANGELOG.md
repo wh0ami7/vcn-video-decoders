@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.4.0 (not released)
+
+- New service fix, *hevc10*: 10-bit HEVC (Main10) hardware encoding on the VCN 3 of RX 6000 cards. Two bugs in
+  `AMDRadeonVADriver2` broke it, and the service changes both places in every `VTEncoderXPCService`, together or
+  not at all:
+  - `Vcn3Encoder::setInputAndOutputFormatParams` told the video engine the input was 8-bit NV12 even in a 10-bit
+    session (a green, striped picture, about 7 dB PSNR): the encoder context gets NV12 and its `x420` branch
+    leaves the packing format at 0. It now sets 10-bit and P010 from the session's 10-bit SPS flag; 8-bit HEVC,
+    H.264 and RGB take the same path as before.
+  - `AVDVcn3HevcEncDataProcessor::setupDeblocking` copied only the picture's Cb/Cr QP offsets (0, 0) into the
+    deblocking packet and dropped the slice's Cr offset of -3 that `AppleGVAHEVCEncoder` sets for 10-bit and the
+    driver writes into the stream (Cr scaled by about 0.73, V PSNR 20.4 dB). It now adds the slice's offsets to
+    the picture's, as Mesa does (0 + 0 for 8-bit).
+- Known for the `AMDRadeonVADriver2` of macOS 26.7.3 (25G342, UUID `1181E2CA-31B3-3DF0-90E2-3AE70552D753`) only.
+  On any other build *hevc10* stays off and `status` and the log say why; the other fixes are not affected.
+- If writing the second place fails, the first one is put back, so a process is never left half patched (this
+  covers every patch made of several sites).
+- `--no-hevc10` (service and `install.sh`) turns it off. `status` now shows `off` for a fix turned off with any
+  `--no-*` option, and exits 3 when every fix is off or unavailable, so the installer's check no longer accepts an
+  install that would do nothing.
+- Kext: new opt-in boot argument `-vcnhevc10` (off by default). With it, the kext prepares `IOGVAHEVCEncode` =
+  `"2"` and profile 2 (HEVC Main10) in `IOGVAHEVCEncodeCapabilities` on supported AMD accelerators, but publishes
+  them only while the service says the driver fix is active, through the root-only sysctl `hw.vcnhevc10`:
+  `vcnencodefix watch` writes 1 when *hevc10* is active and SIP allows access, and 0 when it stops, so
+  VideoToolbox never sends 10-bit HEVC to an unpatched driver. Its state is in `VCNHEVC10` on `IOResources`
+  (`waiting for vcnencodefix service` until then, `off: service says the driver patch is not active` after).
+  `status` shows the gate. Without `-vcnhevc10` the kext behaves as before; with an older kext the service logs
+  once that `hw.vcnhevc10` is not there and goes on. The kext needs the EFI update and a reboot.
+- `tests/hevc10_test.c` (the table, and every site found once in this Mac's driver when it is the 26.7.3 build)
+  and `tests/hevc10_gate_test.cpp` (the kext's gate states) run in `build.sh` next to the cc test.
+- Run on an RX 6800 XT, macOS 26.7.3: 1080p Main10 encode with `hevc_videotoolbox -profile:v main10 -allow_sw 0`,
+  PSNR Y 57.4, U 54.9, V 57.3 dB; 8-bit encodes unchanged. Not run on Sequoia or on an RX 6900 XT.
+
 ## 1.3.0 (not released)
 
 - New service fix, *cc*: the incoming HEVC video of Continuity Camera and FaceTime calls decoded by the GPU

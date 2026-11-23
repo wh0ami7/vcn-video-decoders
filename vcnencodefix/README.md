@@ -36,6 +36,14 @@ From 1.3.0 the service also fixes one decoding problem:
 The cc fix was checked in IDA and with CPU tests on 15.8.2 and 26.7.3, but **not yet run with a real camera or call** (see
 Limitations).
 
+From 1.4.0 it also makes 10-bit HEVC (Main10) hardware encoding work, on macOS 26.7.3 only:
+
+| Problem | What you see | Fixed by |
+|---|---|---|
+| macOS offers no HEVC Main10 hardware encoder on these cards, and the AMD library sends the video engine an 8-bit input format and no Cr quantizer offset for a 10-bit session | no Main10 in hardware; when it is forced, a green striped picture | **vcnencodefix** service (*hevc10*) together with `-vcnhevc10` for the kext |
+
+Measured on an RX 6800 XT (26.7.3), 1080p Main10: PSNR Y 57.4, U 54.9, V 57.3 dB; 8-bit encodes unchanged.
+
 ## Requirements
 
 - A Navi 21 GPU (device ID 0x73A0-0x73AF or 0x73BF). Only an RX 6800 XT has been tested.
@@ -44,6 +52,7 @@ Limitations).
   checks the exact build of the Apple file it changes and stays off on any other build, so a macOS update cannot break
   anything; it only switches the fix off until a new version supports it. The cc fix knows the VideoProcessing of
   **15.8.2** and **26.7.2/26.7.3** only; on 14.8.9 and 15.8.3 it stays off (`status` prints the build it found).
+  The hevc10 fix knows the AMDRadeonVADriver2 of **26.7.3** only and stays off on the others the same way.
 - OpenCore with **Lilu 1.7.0 or newer** (for the kext).
 - For the service: **SIP Debugging Restrictions** off (bit `0x4`, `CSR_ALLOW_TASK_FOR_PID`,
   in `csr-active-config`). The service patches Apple's encoder process (and the video-call processes) the way a debugger
@@ -91,10 +100,12 @@ Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into th
 
 ### Versions of the two halves
 
-The service and the kext never talk to each other, so any 1.2.x or 1.3.x service works with any 1.2.x kext: updating the
-service alone is fine (the service 1.1.0 was installed and tested on the GPU here while the kext was still 1.0.1). A new
-kext only takes effect after a reboot, and every change to its code (1.2.4 and 1.2.5 are) has to be booted once before it
-counts as tested.
+The service and the kext only talk through `hw.vcnhevc10`, and only when `-vcnhevc10` is in the boot arguments, so any
+1.2.x, 1.3.x or 1.4.x service works with any 1.2.x to 1.4.x kext for everything else: updating the service alone is fine
+(the service 1.1.0 was installed and tested on the GPU here while the kext was still 1.0.1). Main10 needs both at 1.4.0:
+a 1.4.0 kext with an older service keeps Main10 back, and a 1.4.0 service with an older kext only patches the driver. A
+new kext only takes effect after a reboot, and every change to its code (1.2.4 and 1.4.0 are) has to be booted once
+before it counts as tested.
 
 ## Check that it works
 
@@ -138,9 +149,9 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   the process creates.
 - Boot arguments for the kext: `-vcnflooroff` turns it off; `-vcnfloorall` also applies the floor to hardware
   *decoding* (not tested); `vcnfloor=N` replaces the floor value the kext requests (default 132297; 0 is ignored;
-  only the default was measured); `-vcnhevc10` (off by default; with the 1.2.6 service it gives a correct 10-bit picture on 26.7.3, see `hevc10` below) prepares
+  only the default was measured); `-vcnhevc10` (off by default; with the 1.4.0 service it gives a correct 10-bit picture on 26.7.3, see `hevc10` below) prepares
   `IOGVAHEVCEncode` = `"2"` and profile 2 (HEVC Main10) in `IOGVAHEVCEncodeCapabilities` on supported AMD
-  accelerators, and with the 1.2.6 kext publishes Main10 only while the running `vcnencodefix` service reports the `hevc10` driver patch active through `hw.vcnhevc10` (waiting at `waiting for vcnencodefix service` or restoring the originals at `off: service says the driver patch is not active` if the macOS build is not validated, `--no-hevc10` is set, or the service stops; needs the 1.2.6 kext on the EFI and a reboot, and without the new kext nothing changes). Its state is in `VCNHEVC10` on `IOResources`; `-vcnfloordbg` and `-vcnfloorbeta` are
+  accelerators, and publishes Main10 only while the running `vcnencodefix` service reports the `hevc10` driver patch active through `hw.vcnhevc10` (waiting at `waiting for vcnencodefix service` or restoring the originals at `off: service says the driver patch is not active` if the macOS build is not validated, `--no-hevc10` is set, or the service stops; needs the 1.4.0 kext on the EFI and a reboot, and without the new kext nothing changes). Its state is in `VCNHEVC10` on `IOResources`, and `status` shows the `gate` line; `-vcnfloordbg` and `-vcnfloorbeta` are
   Lilu's usual debug and newer-macOS switches.
 
 ## How it works
@@ -184,7 +195,9 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   first frame about 260 ms after the start (measured with 1.0.1 in OBS: patched 148 ms after the start). If a frame wider than 4096 is sent before the patch, that frame stalls
   the GPU for a few seconds (version 1.0.0 looked for new processes only every 250 ms and lost that race in OBS at
   5120x2160).
-- HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 only; measured PSNR Y 47.0, U 43.7, V 46.1 dB). Sizes accepted by macOS are unchanged.
+- HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 only; 1080p Main10 measured at
+  PSNR Y 57.4, U 54.9, V 57.3 dB on an RX 6800 XT). Main10 was not run on Sequoia (the fix is off there anyway) or on an
+  RX 6900 XT. Sizes accepted by macOS are unchanged.
 - The cc fix was **not run with a real camera or FaceTime call** here. It removes the same key that an interpose
   library removed in a Continuity Camera test on an RX 6900 XT (15.8.2): that test gave `Created HW video decoder`
   at 60 fps. FaceTime was never tested, with or without it. The patch itself was checked in IDA (VideoProcessing,
@@ -212,6 +225,9 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   so the GPU is not a Navi 21 driven by macOS's AMD driver.
 - `cc unavailable: VideoProcessing build ... is not a validated build`: the cc fix does not know this macOS
   build yet; the encoder fixes are not affected.
+- `hevc10 unavailable: AMDRadeonVADriver2 build ... is not a validated build`: the 10-bit fix does not know this
+  macOS build (only 26.7.3); the kext keeps Main10 back (`VCNHEVC10` = `off: service says the driver patch is not
+  active`) and the other fixes are not affected.
 - The service log is full of `task_for_pid failed ((os/kern) failure)` and nothing gets patched: SIP's Debugging
   Restrictions are on (see Requirements). From 1.2.2 the line ends with ": SIP Debugging Restrictions are on" and
   `./doctor.sh` shows `access REFUSED`.

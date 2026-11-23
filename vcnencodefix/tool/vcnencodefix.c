@@ -912,7 +912,7 @@ static void set_hevc10_gate(int val) {
     if (!gGateOidLoggedMissing) {
       gGateOidLoggedMissing = true;
       logf_("hevc10 gate (%s): not present (VCNEncodeFloor.kext not loaded, "
-            "older than 1.2.6, or -vcnhevc10 not set); continuing without "
+            "older than 1.4.0, or -vcnhevc10 not set); continuing without "
             "kernel gate",
             kHevc10GateSysctl);
     }
@@ -971,7 +971,7 @@ static int cmd_status(void) {
                 : "Main10 withheld by kext until service is active");
   else if (errno == ENOENT)
     printf("  gate    unavailable  %s not present (VCNEncodeFloor.kext not "
-           "loaded, older than 1.2.6, or -vcnhevc10 not set)\n",
+           "loaded, older than 1.4.0, or -vcnhevc10 not set)\n",
            kHevc10GateSysctl);
   else
     printf("  gate    unavailable  %s: %s\n", kHevc10GateSysctl,
