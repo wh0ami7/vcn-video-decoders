@@ -71,6 +71,9 @@ $B/obj/wide_test | tail -1
 xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
   tests/cc_test.c tests/run_cc.s tool/patches.c -framework VideoToolbox -o $B/obj/cc_test
 $B/obj/cc_test ${=CC_IMAGES:-} | tail -1
+xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fblocks -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+  tests/hevc10_test.c tool/patches.c -o $B/obj/hevc10_test
+$B/obj/hevc10_test | tail -1
 xcrun clang++ -std=c++17 -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined tests/floor_test.cpp -o $B/obj/floor_test
 $B/obj/floor_test | tail -1
 if [[ -n $OC_SAMPLE && -f $OC_SAMPLE ]]; then zsh tests/efi_test.sh ${B:A}/vcnencodefix $OC_SAMPLE | tail -1
