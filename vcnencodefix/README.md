@@ -67,7 +67,7 @@ use the package by hand (`VCNEncodeFix-<version>.zip`, or `vcnencodefix/prebuilt
 
 Download and unpack `VCNEncodeFix-<version>.zip`, open Terminal and `cd` into the folder.
 
-1. **Service** (preset and wide-size fixes; active immediately, no reboot):
+1. **Service** (preset, wide-size and 10-bit HEVC fixes; active immediately, no reboot):
 
    ```
    sudo ./install.sh
@@ -105,7 +105,7 @@ counts as tested.
 ```
 
 A healthy doctor output shows `VCNEncodeFloor: loaded <version>, active: encode`, the service `running`, and
-`preset`, `wide` and `cc` as `available`.
+`preset`, `wide`, `cc` and `hevc10` as `available`.
 
 To check the cc fix: start the iPhone camera in any app, or a FaceTime video call, then
 
@@ -131,13 +131,14 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
 
 - `sudo ./install.sh --preset balance` (or `quality`): a slower preset with better quality per bit than `speed`.
   The default `speed` is the one measured above; the others were not measured.
-- `sudo ./install.sh --no-wide`, `--no-preset` or `--no-cc`: install with that service fix off (they combine).
+- `sudo ./install.sh --no-wide`, `--no-preset`, `--no-cc` or `--no-hevc10`: install with that service fix off (they
+  combine).
 - One process only: `sudo /usr/local/libexec/vcnencodefix unpatch <pid>` puts Apple's bytes back in that
   ContinuityCaptureAgent or avconferenced (`patch <pid>` writes them again). It takes effect for the next decoder
   the process creates.
 - Boot arguments for the kext: `-vcnflooroff` turns it off; `-vcnfloorall` also applies the floor to hardware
   *decoding* (not tested); `vcnfloor=N` replaces the floor value the kext requests (default 132297; 0 is ignored;
-  only the default was measured); `-vcnhevc10` (experimental, off by default, not run on a GPU yet) sets
+  only the default was measured); `-vcnhevc10` (off by default; with the 1.2.6 service it gives a correct 10-bit picture on 26.7.3, see `hevc10` below) sets
   `IOGVAHEVCEncode` to `"2"` and adds profile 2 (HEVC Main10) to `IOGVAHEVCEncodeCapabilities` on supported AMD
   accelerators, and publishes its state in `VCNHEVC10` on `IOResources`; `-vcnfloordbg` and `-vcnfloorbeta` are
   Lilu's usual debug and newer-macOS switches.
@@ -152,6 +153,7 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   process (where macOS runs hardware encoders) it changes a few instructions in that process's memory, the way a
   debugger sets a breakpoint. Files on disk, the system volume and other processes are never touched.
   - *preset*: the driver reads the preset from a field nobody sets; the read becomes the constant "speed".
+  - *hevc10* (26.7.3 only): the AMD library told the video engine the input was 8-bit NV12 for a 10-bit session and never passed the chroma quantizer offset the stream header declares for 10 bits (Cr -3). The service changes those two places in the driver, together or not at all. 8-bit and H.264 sessions are unaffected.
   - *wide*: just before the statistics job is sent to the GPU, the work is split into more, smaller thread groups
     (for example 2 x 160 threads instead of 1 x 320 for 5120 wide). The total work is the same, and below 4097 pixels
     wide nothing changes at all.
@@ -182,7 +184,7 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   first frame about 260 ms after the start (measured with 1.0.1 in OBS: patched 148 ms after the start). If a frame wider than 4096 is sent before the patch, that frame stalls
   the GPU for a few seconds (version 1.0.0 looked for new processes only every 250 ms and lost that race in OBS at
   5120x2160).
-- HEVC Main only (as macOS itself on these cards). Sizes accepted by macOS are unchanged.
+- HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 only; measured PSNR Y 47.0, U 43.7, V 46.1 dB). Sizes accepted by macOS are unchanged.
 - The cc fix was **not run with a real camera or FaceTime call** here. It removes the same key that an interpose
   library removed in a Continuity Camera test on an RX 6900 XT (15.8.2): that test gave `Created HW video decoder`
   at 60 fps. FaceTime was never tested, with or without it. The patch itself was checked in IDA (VideoProcessing,
