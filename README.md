@@ -35,6 +35,23 @@ decode messages and submit them through the driver, then hand the frames back to
 VP9 is not in Apple's driver at all. `vcnvp9` builds the VCN VP9 messages itself, following the
 same layout as Mesa's `ac_vcn_dec.h`.
 
+## Decoders 0.3.5
+
+- The `stats` log line now counts a frame as slow against the stream's own frame time. Before,
+  it counted every frame whose queue wait plus decode passed a fixed 16.7 ms, so a 30 fps video
+  showed 60 to 80 slow frames out of 120 while it played with time to spare, and the normal
+  queue wait (up to four frames in flight) made 60 fps look worse than it was. Now a frame counts
+  only when its decode alone takes longer than the frame time, taken from the sample's duration
+  or, when the caller gives none, from the step between presentation times (steps over 100 ms
+  are seeks and are skipped; 60 fps is assumed until a time is known). The line shows the
+  average frame time it used: `decode over frame time (avg 33.4 ms) 0`. Samples that carry only
+  a hidden frame do not change the frame time, and a new session learns it again.
+- It is the stream's time, not the wall clock's: at 2x playback each frame really has half of
+  it.
+- Decoding itself is unchanged; both plug-ins move to 0.3.5.
+
+Checked with `tests/run.sh`.
+
 ## Decoders 0.3.4
 
 - The VP9 plug-in now declares a rating (`VTRating` 400 in its `CMMatchingInfo`, the value Apple
