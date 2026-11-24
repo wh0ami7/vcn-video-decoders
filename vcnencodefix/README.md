@@ -33,8 +33,14 @@ From 1.3.0 the service also fixes one decoding problem:
 |---|---|---|
 | Continuity Camera (an iPhone used as the Mac's camera) and FaceTime calls ask for the "FaceTime" HEVC decoder, which the AMD driver refuses | the video works, but the HEVC stream is decoded by the CPU; the log shows `[HEVC] GVA ERROR: Couldn't set the stream resolution` | **vcnencodefix** service (*cc*) |
 
-The cc fix was checked in IDA and with CPU tests on 15.8.2 and 26.7.3, but **not yet run with a real camera or call** (see
-Limitations).
+The cc fix was checked in IDA and with CPU tests on 15.8.2 and 26.7.3, and run with a real iPhone camera on an RX 6900 XT
+(15.8.2); a FaceTime call was not tested yet (see Limitations).
+
+From 1.5.0 the cc fix also covers FaceTime's own video encoder:
+
+| Problem | What you see | Fixed by |
+|---|---|---|
+| On a Mac Pro (MacPro7,1) or iMac Pro (iMacPro1,1) SMBIOS, FaceTime's encoder is sent to the T2 chip, which a Mac without a T2 does not have | no outgoing video in FaceTime; the log shows `No bridgeOS device available` and `Failed to create remote video encoder with usage 42 on macOS, err = -18!` | **vcnencodefix** service (*cc*) |
 
 From 1.4.0 it also makes 10-bit HEVC (Main10) hardware encoding work, on macOS 26.7.3 only:
 
@@ -129,6 +135,16 @@ grep -E "ContinuityCaptureAgent|avconferenced" /var/log/vcnencodefix.log | tail 
 set the stream resolution` followed by a software decoder means it did not. FaceTime picks HEVC or H.264 with the
 other side; only HEVC had the problem (the decoder line names the codec).
 
+For FaceTime's encoder (Mac Pro and iMac Pro SMBIOS), during a call:
+
+```
+/usr/bin/log show --last 3m --predicate 'eventMessage CONTAINS "VCPEnc" OR eventMessage CONTAINS "bridgeOS"' | grep -E "Created video encoder|remote video encoder|bridgeOS"
+```
+
+`Created video encoder with usage 42 on macOS` is the fix working; `No bridgeOS device available` means it did not.
+`build/obj/ftenc_test` (built by `build.sh`, run by hand) shows the same thing without a call: it asks VideoProcessing
+for FaceTime's encoder before and after writing the patch in its own process only.
+
 ## Uninstall
 
 ```
@@ -175,7 +191,13 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
     removes that key right before the hardware decoder (and puts it back for the software retry), but only for
     other codecs on some board-ids; the patch makes that removal run for every codec. The same key sent later as a
     session property is dropped too, by Apple's own check for it, which has the same limit. No setting avoids it:
-    the `FaceTimeDecoder` preference only flips a flag. Every other process keeps Apple's code.
+    the `FaceTimeDecoder` preference only flips a flag. A third change is for the encoder: VideoProcessing sends
+    FaceTime's encoder (usage 42) to the T2 chip when the board-id is the Mac Pro's or the iMac Pro's, and with the
+    same check tells FaceTime that H.264 is unsupported, so it asks for HEVC, which the local encoder path refuses.
+    The patch jumps over the two board-id compares in that check (the board-id string is still released), so H.264
+    is offered and the encoder is a local VideoToolbox one (the GPU's when FaceTime asks for hardware). Apple's
+    `BridgeEncode` preference, which also needs a real bridge device, still works as before. Every other process
+    keeps Apple's code.
 
   Before writing, it checks that the file is the validated build, that the bytes to change are exactly the expected
   ones, and that no thread is running them at that moment.
@@ -198,9 +220,11 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
 - HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 only; 1080p Main10 measured at
   PSNR Y 57.4, U 54.9, V 57.3 dB on an RX 6800 XT). Main10 was not run on Sequoia (the fix is off there anyway) or on an
   RX 6900 XT. Sizes accepted by macOS are unchanged.
-- The cc fix was **not run with a real camera or FaceTime call** here. It removes the same key that an interpose
-  library removed in a Continuity Camera test on an RX 6900 XT (15.8.2): that test gave `Created HW video decoder`
-  at 60 fps. FaceTime was never tested, with or without it. The patch itself was checked in IDA (VideoProcessing,
+- The cc fix was run with a real iPhone camera on an RX 6900 XT (15.8.2, version 1.3.0: `Created HW video decoder`,
+  HEVC 1920x1088 decoded in 5 to 9 ms a frame). FaceTime calls were not tested, with or without it. The encoder part
+  (1.5.0) was run on its exact code in a test process on a MacPro7,1 SMBIOS (26.7.3, RX 6800 XT,
+  `tests/ftenc_test.c`): before, H.264 reported unsupported and the session failed with -18; after, H.264
+  supported and the session, with hardware required, encoded 30 frames. Not run in a FaceTime call or on Sequoia. The patch itself was checked in IDA (VideoProcessing,
   and AVConference to find who adds the key), by finding every site once in each validated build (and in this
   Mac's running 26.7.3), and by running the original and patched code on the CPU with the calls recorded. A
   process already running when the service starts is patched then, and the fix applies to the next decoder it

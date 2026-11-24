@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.5.0 (not released)
+
+- *cc* also fixes FaceTime's video encoder on a Mac Pro (MacPro7,1) or iMac Pro (iMacPro1,1) SMBIOS. On those
+  board-ids VideoProcessing sends FaceTime's encoder (`VCPCompressionSessionCreate`, usage 42) to the T2's remote
+  encoder, which a Mac without a T2 does not have: `No bridgeOS device available`, error -18, no outgoing video.
+  The same check makes `VCPCodecCopyProperties` report H.264 as unsupported for usage 42, so AVConference asks for
+  HEVC, which the local path refuses (`No HEVC video encoder support for FaceTime on Mac yet`). A fourth cc site
+  (E) jumps over the check's two board-id compares to its own release of the board-id string and its
+  `BridgeEncode` preference check, so it answers no unless that preference is set and a bridge device exists, as
+  on any other Mac. Then H.264 is offered and the session is a local VideoToolbox one (`h264.gva` when hardware is
+  required). Same builds as before: VideoProcessing of 15.8.2 and 26.7.2/26.7.3 (the check is the same code in
+  both, only its call and string offsets differ).
+- A process that an older version patched (sites K, A and B only) is now completed with the missing site instead
+  of being left alone as "unexpected bytes"; `status` shows such a process as `partly patched`.
+- `tests/cc_test.c` covers site E: lookup and state like the other sites, the original and the patched check run on
+  the CPU for both board-ids, another one and none, with and without `BridgeEncode` and a bridge device, and on this
+  Mac the two board-id strings, `BridgeEncode` and every call of the check. New `tests/ftenc_test.c`, built by
+  `build.sh` and run by hand: on a Mac Pro or iMac Pro board-id it asks VideoProcessing for FaceTime's encoder
+  before and after writing site E in its own process.
+- Run on an RX 6800 XT, macOS 26.7.3, MacPro7,1 SMBIOS, with `ftenc_test`: before, `VCPCodec_AVC1` 0 and the
+  session -18 (the log shows `No bridgeOS device available`); after, `VCPCodec_AVC1` 1 and `Created video encoder
+  with usage 42 on macOS`, 30 H.264 frames with hardware required. Not run in a FaceTime call or on Sequoia.
+- Only the service changed. The kext's code is the same as 1.4.0 (it says 1.5.0 because `build.sh` stamps the
+  version), so the EFI does not need updating and no reboot is needed for this fix.
+
 ## 1.4.0 (not released)
 
 - New service fix, *hevc10*: 10-bit HEVC (Main10) hardware encoding on the VCN 3 of RX 6000 cards. Two bugs in
