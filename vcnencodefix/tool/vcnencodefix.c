@@ -9,9 +9,11 @@
 //   hevc10  AMDRadeonVADriver2: VCN 3 10-bit HEVC gets 10-bit P010 input
 //           format packets and the slice's Cr QP offset
 // and one inside every ContinuityCaptureAgent (an iPhone used as a camera) and
-// avconferenced (FaceTime calls), the processes that decode video calls:
+// avconferenced (FaceTime calls), the processes that handle video calls:
 //   cc      VideoProcessing: the incoming HEVC stream is decoded by the GPU
-//           instead of the CPU
+//           instead of the CPU, and FaceTime's encoder is a local one instead
+//           of the T2's (which a Mac Pro or iMac Pro board-id without a T2
+//           does not have)
 // See patches.c for what each patch changes. The bytes are written into the
 // target the way a debugger writes a breakpoint: the page is made copy-on-write
 // in that process only and the process is suspended for the write. Nothing on
@@ -461,10 +463,17 @@ static void locate_wide(void) {
 
 // ---- target processes ----
 
-typedef enum { kOriginal, kPatched, kOther, kUnreadable, kNotLoaded } State;
+typedef enum {
+  kOriginal,
+  kPatched,
+  kOther,
+  kUnreadable,
+  kNotLoaded,
+  kPartial
+} State;
 static const char* state_str(State s) {
-  static const char* n[] = {"original", "patched", "unexpected bytes",
-                            "unreadable", "not loaded yet"};
+  static const char* n[] = {"original",   "patched",        "unexpected bytes",
+                            "unreadable", "not loaded yet", "partly patched"};
   return n[s];
 }
 
@@ -756,8 +765,10 @@ static int do_wide(task_t task, bool remove, char* msg, size_t len) {
   return 0;
 }
 
-// State of both cc sites in a target: kOriginal / kPatched when both are,
-// kOther when any site holds other bytes (or they disagree), kUnreadable.
+// State of the cc sites in a target: kOriginal / kPatched when all are,
+// kPartial when some are patched and the others original (a process patched
+// by an older version, which had fewer sites), kOther when any site holds
+// other bytes, kUnreadable.
 static State cc_state(task_t task, int st[kCcSites]) {
   bool unreadable = false;
   int orig = 0, patched = 0, written = 0;
@@ -781,7 +792,7 @@ static State cc_state(task_t task, int st[kCcSites]) {
   if (unreadable) return kUnreadable;
   if (orig == written) return kOriginal;
   if (patched == written) return kPatched;
-  return kOther;  // some patched, some not: not written by this tool
+  return kPartial;
 }
 
 // Like do_preset, for a video-call process.
@@ -793,8 +804,14 @@ static int do_cc(task_t task, bool remove, char* msg, size_t len) {
     return 1;
   }
   if (s == kOther) {
-    snprintf(msg, len, "cc: %s (sites K %d, A %d, B %d), left alone",
-             state_str(s), st[0], st[1], st[2]);
+    char sites[64] = "";
+    for (int k = 0; k < kCcSites; k++) {
+      char one[16];
+      snprintf(one, sizeof(one), "%s%c %d", k ? ", " : "", kCcSiteName[k],
+               st[k]);
+      strlcat(sites, one, sizeof(sites));
+    }
+    snprintf(msg, len, "cc: %s (sites %s), left alone", state_str(s), sites);
     return -1;
   }
   if ((remove && s == kOriginal) || (!remove && s == kPatched)) {
@@ -803,9 +820,9 @@ static int do_cc(task_t task, bool remove, char* msg, size_t len) {
   }
   Region r[kCcSites];
   int nr = 0;
-  for (int k = 0; k < kCcSites; k++) {
+  for (int k = 0; k < kCcSites; k++) {  // only the sites not already there
     const CcSite* c = &gCc.build->site[k];
-    if (c->n)
+    if (c->n && st[k] != (remove ? 0 : 1))
       r[nr++] = (Region){gCc.site[k] + c->off, c->n,
                          remove ? c->find + c->off : gCc.repl[k]};
   }
@@ -816,7 +833,10 @@ static int do_cc(task_t task, bool remove, char* msg, size_t len) {
   }
   snprintf(msg, len,
            remove ? "cc: restored"
-                  : "cc: patched (video-call decoders without DecoderUsage)");
+           : s == kPartial
+               ? "cc: completed (the sites an older version left out)"
+               : "cc: patched (video-call decoders without "
+                 "DecoderUsage, FaceTime encoder local)");
   return 0;
 }
 
@@ -948,9 +968,11 @@ static int cmd_status(void) {
     printf("  wide    unavailable  %s\n", gWide.reason);
   if (gCc.available)
     printf(
-        "  cc      %-12s Continuity Camera and FaceTime HEVC on the GPU "
-        "(VideoProcessing sites 0x%llx, 0x%llx)\n",
-        gCc.enabled ? "available" : "off", gCc.site[1], gCc.site[2]);
+        "  cc      %-12s Continuity Camera and FaceTime HEVC on the GPU, "
+        "FaceTime encoder without the T2 (VideoProcessing sites 0x%llx, "
+        "0x%llx, 0x%llx)\n",
+        gCc.enabled ? "available" : "off", gCc.site[1], gCc.site[2],
+        gCc.site[3]);
   else
     printf("  cc      unavailable  %s\n", gCc.reason);
   if (gHevc10.available)

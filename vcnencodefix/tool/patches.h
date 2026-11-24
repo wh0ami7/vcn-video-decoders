@@ -1,6 +1,6 @@
 // patches.h - the user-space patches applied by vcnencodefix: three inside
 // VTEncoderXPCService (preset, wide, hevc10), one inside ContinuityCaptureAgent
-// (cc).
+// and avconferenced (cc).
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -58,9 +58,16 @@ void build_wide(const WideBuild* b, uint8_t outCall[kWideCallLen],
 extern const char* const kCcImage;
 extern const char* const kCcTargets[];  // NULL-terminated process paths
 // K: where VCPDec keeps the DecoderUsage key (checked, never written);
-// A: the Usage removal before the hardware decoder; B: the Usage property.
-enum { kCcSites = 3 };
-enum { kCcMaxFind = 128, kCcTgtLen = 32, kCcMaxWrite = 10 };
+// A: the Usage removal before the hardware decoder; B: the Usage property;
+// E: the board-id check that sends FaceTime's encoder (usage 42) to the T2.
+enum { kCcSites = 4 };
+enum { kCcMaxFind = 160, kCcTgtLen = 32, kCcMaxWrite = 10 };
+extern const char kCcSiteName[kCcSites + 1];  // "KABE"
+// E's layout (the same in every validated build): the two board-id compares
+// (lea rsi, <board-id>; ...; call CFStringCompare) at kCcEFirst and
+// kCcESecond, the release of the board-id string and the BridgeEncode
+// preference right after them at kCcERelease.
+enum { kCcEFirst = 0x13, kCcESecond = 0x29, kCcERelease = 0x3f };
 typedef struct {
   uint8_t len;               // bytes of find in use
   uint8_t find[kCcMaxFind];  // must occur once in VideoProcessing's __text
@@ -77,7 +84,7 @@ typedef struct {
 } CcBuild;
 const CcBuild* cc_build(const char* uuid);  // NULL if not validated
 const CcBuild* cc_build_at(size_t i);       // the table, for the tests
-// Finds the three sites in __text (text = its bytes, textVm = its address);
+// Finds the sites in __text (text = its bytes, textVm = its address);
 // NULL and *why set if anything does not match exactly. sites[k] = address of
 // site k's first byte.
 const CcBuild* cc_locate(const CcBuild* b, const uint8_t* text, size_t size,

@@ -1,10 +1,11 @@
 // cc_test.c - checks the "cc" patch (Continuity Camera and FaceTime HEVC
 // decode) for every validated build of VideoProcessing, on this CPU:
-//   1. lookup: cc_locate (the service's own code) finds the three sites
+//   1. lookup: cc_locate (the service's own code) finds the four sites
 //      exactly once in a __text built around the build's bytes, and refuses a
 //      duplicate, a change of any single byte of a site or of B's target, a B
-//      whose key load is not K's, and an A that removes another slot than the
-//      one K stores the key in;
+//      whose key load is not K's, an A that removes another slot than the
+//      one K stores the key in, and an E whose compares call another function
+//      than B's CFStringCompare;
 //   2. state: cc_site_state reads the original and the patched bytes back as
 //      such, and any other single-byte change as "unexpected bytes";
 //   3. code: the original and the patched bytes run on the CPU with the calls
@@ -13,14 +14,23 @@
 //      looked up for removal for every codec and board-id. B original sends
 //      DecoderUsage on (flag set) or to the codec checks (flag clear); B
 //      patched skips DecoderUsage and sends every other key down the path the
-//      original took with the flag set, whatever the flag;
+//      original took with the flag set, whatever the flag. E (the whole
+//      board-id check) original answers yes for the two board-ids Apple lists
+//      and otherwise only for BridgeEncode with a bridge device; E patched
+//      never compares the board-id, still releases it, and still answers the
+//      BridgeEncode path as the original does;
 //   4. this Mac: when its own shared cache holds a validated build, the sites
 //      are found once in it, K loads kVTVideoDecoderSpecification_Usage and the
 //      calls go to CFDictionaryAddValue (K), CFDictionaryContainsKey (A) and
-//      CFStringCompare (B);
+//      CFStringCompare (B); E compares with the CFStrings Mac-7BA5B2D9E42DDD94
+//      and Mac-27AD2F918AE68F61, reads the BridgeEncode preference of
+//      com.apple.VideoProcessing and calls CFStringCompare, CFRelease,
+//      CFPreferencesGetAppBooleanValue, remote_device_copy_unique_of_type and
+//      CFLog;
 //   5. files: each VideoProcessing given on the command line (a copy taken out
 //      of a dyld shared cache) is checked like 4, by its bytes, and its sites
 //      must be where IDA has them.
+#include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/loader.h>
@@ -47,11 +57,11 @@ static const struct {
   uint64_t site[kCcSites], skip, noRemove;
 } kSites[] = {
     {"3EE0D5DE-F382-3E55-B793-03DCA33EB76E",
-     {0x7FF912FB4500, 0x7FF912FB5E79, 0x7FF912FBD635},
+     {0x7FF912FB4500, 0x7FF912FB5E79, 0x7FF912FBD635, 0x7FF912FA024D},
      0x7FF912FB5F20,
      0x7FF912FB5F1D},  // 26.7.2, 26.7.3
     {"7B6360AC-5775-3F01-B253-5F199DD57F7C",
-     {0x7FF90E44CA4B, 0x7FF90E44DD24, 0x7FF90E45259A},
+     {0x7FF90E44CA4B, 0x7FF90E44DD24, 0x7FF90E45259A, 0x7FF90E43CBED},
      0x7FF90E44DDA5,
      0x7FF90E44DDA2},  // 15.8.2
 };
@@ -86,11 +96,14 @@ static uint8_t rnd(void) {
   return (uint8_t)(gSeed >> 16);
 }
 
-// A fake __text: random bytes with K at 0x1000 and A and B at their real
-// distances from K.
-enum { kTextLen = 0x20000 };
+// A fake __text: random bytes with the first site at 0x1000 and the others at
+// their real distances from it.
+enum { kTextLen = 0x40000, kCopyAt = 0x3c000 };
 static uint64_t at_of(int idx, int k) {
-  return 0x1000 + kSites[idx].site[k] - kSites[idx].site[0];
+  uint64_t first = kSites[idx].site[0];
+  for (int i = 1; i < kCcSites; i++)
+    if (kSites[idx].site[i] < first) first = kSites[idx].site[i];
+  return 0x1000 + kSites[idx].site[k] - first;
 }
 static void layout(const CcBuild* b, int idx, uint8_t* text) {
   for (size_t i = 0; i < kTextLen; i++) text[i] = rnd();
@@ -128,7 +141,7 @@ static void test_lookup(const CcBuild* b, int idx) {
       refused += !cc_locate(b, text, kTextLen, vm, sites, why, sizeof(why));
     }
     layout(b, idx, text);  // a second copy
-    memcpy(text + 0x1c000, s->find, s->len);
+    memcpy(text + kCopyAt, s->find, s->len);
     tried++;
     refused += !cc_locate(b, text, kTextLen, vm, sites, why, sizeof(why)) &&
                strstr(why, "2 times");
@@ -152,6 +165,15 @@ static void test_lookup(const CcBuild* b, int idx) {
   tried++;
   refused += !cc_locate(&other, text, kTextLen, vm, sites, why, sizeof(why)) &&
              strstr(why, "remove the key");
+  // E's two compares calling another function than B's check (both rel32 moved
+  // by one, table and bytes together)
+  other = *b;
+  for (int c = kCcEFirst; c <= kCcESecond; c += kCcESecond - kCcEFirst)
+    other.site[3].find[c + 13]++;
+  layout(&other, idx, text);
+  tried++;
+  refused += !cc_locate(&other, text, kTextLen, vm, sites, why, sizeof(why)) &&
+             strstr(why, "CFStringCompare");
   CHECK(refused == tried, "%s: %d of %d altered layouts refused", b->macos,
         refused, tried);
   printf("lookup: found once; %d of %d altered layouts refused\n", refused,
@@ -167,11 +189,11 @@ static void test_state(const CcBuild* b) {
     memcpy(tgt, s->tgt, kCcTgtLen);
     memcpy(cur, s->find, s->len);
     CHECK(cc_site_state(s, cur, tgt) == 0, "%s site %c: original not seen",
-          b->macos, "KAB"[k]);
+          b->macos, kCcSiteName[k]);
     build_cc(s, w);
     memcpy(cur + s->off, w, s->n);
     CHECK(cc_site_state(s, cur, tgt) == (s->n ? 1 : 0),
-          "%s site %c: patched not seen", b->macos, "KAB"[k]);
+          "%s site %c: patched not seen", b->macos, kCcSiteName[k]);
     for (int base = 0; base < 2; base++)  // from original, from patched
       for (int i = 0; i < s->len; i++) {
         memcpy(cur, s->find, s->len);
@@ -377,6 +399,113 @@ static void test_code_b(const CcBuild* b) {
   munmap(m, len);
 }
 
+// "movabs rax, &val; mov rax, [rax]; ret": a call answering val (64 bits).
+static void answer64(uint8_t* p, const uint64_t* val) {
+  p[0] = 0x48;
+  p[1] = 0xb8;
+  memcpy(p + 2, &val, 8);
+  p[10] = 0x48;
+  p[11] = 0x8b;
+  p[12] = 0x00;
+  p[13] = 0xc3;
+}
+// "jmp to": the stubs of a shared cache are 6 bytes apart, the thunks longer.
+static void jmp_to(uint8_t* p, const uint8_t* to) {
+  p[0] = 0xe9;
+  int32_t rel = (int32_t)(to - (p + 5));
+  memcpy(p + 1, &rel, 4);
+}
+
+static void test_code_e(const CcBuild* b) {
+  const CcSite* s = &b->site[3];
+  const uint8_t* f = s->find;
+  const int a = kCcEFirst, c2 = kCcESecond, r = kCcERelease;
+  // the calls of the check, by their place in it
+  int64_t readOff = 11 + (int64_t)get32(f + 7);
+  int64_t cmpOff = a + 17 + (int64_t)get32(f + a + 13);
+  int64_t relOff = r + 8 + (int64_t)get32(f + r + 4);
+  int64_t prefOff = 0x5e + (int64_t)get32(f + 0x5a);
+  int64_t devOff = 0x6c + (int64_t)get32(f + 0x68);
+  int64_t logOff = 0x9e + (int64_t)get32(f + 0x9a);
+  bool shape = f[0x59] == 0xe8 && f[0x67] == 0xe8 && f[0x99] == 0xe8 &&
+               f[0x79] == 0xe8 && 0x7e + get32(f + 0x7a) == relOff &&
+               readOff < 0 && readOff > -kPad;
+  CHECK(shape, "%s E: calls not where expected", b->macos);
+  if (!shape) return;
+  int64_t far = cmpOff;
+  int64_t offs[] = {relOff, prefOff, devOff, logOff};
+  for (int i = 0; i < 4; i++)
+    if (offs[i] > far) far = offs[i];
+  size_t len;
+  uint8_t* m = space((uint64_t)far + 64 + 6 * 64, &len);
+  if (!m) {
+    printf("FAIL mmap\n");
+    gFails++;
+    return;
+  }
+  uint8_t* site = m + kPad;
+  uint8_t* th = site + far + 64;  // the thunks, 64 bytes each
+  static uint64_t board, dev;
+  static uint32_t pref;
+  uint64_t recCmp[4], recRel[4], recLog[4];
+  answer64(site + readOff, &board);
+  thunk(th, recCmp, true);
+  jmp_to(site + cmpOff, th);
+  thunk(th + 64, recRel, false);
+  jmp_to(site + relOff, th + 64);
+  answer(th + 128, &pref);
+  jmp_to(site + prefOff, th + 128);
+  answer64(th + 192, &dev);
+  jmp_to(site + devOff, th + 192);
+  thunk(th + 256, recLog, false);
+  jmp_to(site + logOff, th + 256);
+  // the addresses the two lea rsi produce: the board-id CFStrings
+  uint64_t id1 = (uint64_t)site + a + 7 + (int64_t)get32(f + a + 3);
+  uint64_t id2 = (uint64_t)site + c2 + 7 + (int64_t)get32(f + c2 + 3);
+  const uint64_t other = 0x4f54480000000010, bridge = 0x4252490000000020;
+  const uint64_t boards[] = {0, id1, id2, other};
+  int ok = 0, runs = 0;
+  for (int patched = 0; patched < 2; patched++)
+    for (int bi = 0; bi < 4; bi++)
+      for (int path = 0; path < 3; path++) {  // no pref; pref, no device; both
+        memcpy(site, f, s->len);
+        uint8_t w[kCcMaxWrite];
+        build_cc(s, w);
+        if (patched) memcpy(site + s->off, w, s->n);
+        board = boards[bi];
+        pref = path > 0;
+        dev = path == 2 ? bridge : 0;
+        memset(recCmp, 0, sizeof(recCmp));
+        memset(recRel, 0, sizeof(recRel));
+        memset(recLog, 0, sizeof(recLog));
+        uint64_t (*check)(void) = (uint64_t (*)(void))(void*)site;
+        uint8_t got = (uint8_t)check();
+        bool listed = !patched && (bi == 1 || bi == 2);
+        uint8_t want = listed || path == 2;
+        uint64_t cmps = patched || bi == 0 ? 0 : bi == 1 ? 1 : 2;
+        // released: the board-id string (when there is one), and the device
+        // when the BridgeEncode path found one; a listed board-id ends there
+        uint64_t rels = (bi != 0) + (!listed && path == 2);
+        uint64_t logs = !listed && path == 1;
+        bool good = got == want && recCmp[3] == cmps && recRel[3] == rels &&
+                    recLog[3] == logs;
+        if (good && rels)  // the last release: the device, else the board-id
+          good = recRel[0] == (!listed && path == 2 ? bridge : board);
+        runs++;
+        ok += good;
+        CHECK(good,
+              "%s E %s board %d path %d: answer %d (want %d), compares %llu "
+              "(want %llu), releases %llu (want %llu), logs %llu",
+              b->macos, patched ? "patched" : "original", bi, path, got, want,
+              recCmp[3], cmps, recRel[3], rels, recLog[3]);
+      }
+  printf(
+      "code E: %d of %d runs as expected (patched: the board-id is released "
+      "without being compared, BridgeEncode answers as before)\n",
+      ok, runs);
+  munmap(m, len);
+}
+
 // ---- 4, 5: real images ----
 
 static const struct section_64* text_of(const struct mach_header_64* mh,
@@ -504,6 +633,45 @@ static void test_live(void) {
       "this Mac: K loads kVTVideoDecoderSpecification_Usage and calls %s; A "
       "calls %s; B's check calls %s\n",
       sym(add), sym(has), sym(cmp));
+  // E: what the lea instructions point to and where the calls go
+  const uint8_t* e = (const uint8_t*)sites[3];
+#define LEA(o) ((CFStringRef)(sites[3] + (o) + 7 + (int64_t)get32(e + (o) + 3)))
+#define CALL(o) stub_target(sites[3] + (o) + 5 + (int64_t)get32(e + (o) + 1))
+  struct {
+    CFStringRef got;
+    const char* want;
+  } str[] = {{LEA(kCcEFirst), "Mac-7BA5B2D9E42DDD94"},
+             {LEA(kCcESecond), "Mac-27AD2F918AE68F61"},
+             {LEA(kCcERelease + 8), "BridgeEncode"},
+             {LEA(kCcERelease + 15), "com.apple.VideoProcessing"}};
+  for (size_t i = 0; i < sizeof(str) / sizeof(str[0]); i++) {
+    char buf[64] = "";
+    bool isStr =
+        CFGetTypeID(str[i].got) == CFStringGetTypeID() &&
+        CFStringGetCString(str[i].got, buf, sizeof(buf), kCFStringEncodingUTF8);
+    CHECK(isStr && !strcmp(buf, str[i].want), "this Mac: E's string %zu is %s",
+          i, buf);
+  }
+  struct {
+    int at;
+    const char* want;
+  } call[] = {{kCcEFirst + 12, "CFStringCompare"},
+              {kCcESecond + 12, "CFStringCompare"},
+              {kCcERelease + 3, "CFRelease"},
+              {0x59, "CFPreferencesGetAppBooleanValue"},
+              {0x67, "remote_device_copy_unique_of_type"},
+              {0x79, "CFRelease"},
+              {0x99, "CFLog"}};
+  for (size_t i = 0; i < sizeof(call) / sizeof(call[0]); i++)
+    CHECK(e[call[i].at] == 0xe8 && !strcmp(sym(CALL(call[i].at)), call[i].want),
+          "this Mac: E's call at +0x%x goes to %s", call[i].at,
+          sym(CALL(call[i].at)));
+#undef LEA
+#undef CALL
+  printf(
+      "this Mac: E compares the board-id with Mac-7BA5B2D9E42DDD94 and "
+      "Mac-27AD2F918AE68F61, then reads BridgeEncode; its calls go where "
+      "expected\n");
 }
 
 static void test_file(const char* path) {
@@ -534,8 +702,8 @@ static void test_file(const char* path) {
     int idx = b ? site_index(b->uuid) : -1;
     for (int k = 0; idx >= 0 && k < kCcSites; k++)
       CHECK(sites[k] == kSites[idx].site[k],
-            "%s: site %c at 0x%llx, IDA had 0x%llx", path, "KAB"[k], sites[k],
-            kSites[idx].site[k]);
+            "%s: site %c at 0x%llx, IDA had 0x%llx", path, kCcSiteName[k],
+            sites[k], kSites[idx].site[k]);
   }
   munmap(map, (size_t)st.st_size);
 }
@@ -555,6 +723,7 @@ int main(int argc, char** argv) {
     test_state(b);
     test_code_a(b, idx);
     test_code_b(b);
+    test_code_e(b);
   }
   printf("== real images\n");
   test_live();

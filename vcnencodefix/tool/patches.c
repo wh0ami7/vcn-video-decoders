@@ -1,5 +1,6 @@
 // patches.c - the user-space patches applied by vcnencodefix: preset, wide
-// and hevc10 inside VTEncoderXPCService, cc inside ContinuityCaptureAgent.
+// and hevc10 inside VTEncoderXPCService, cc inside ContinuityCaptureAgent and
+// avconferenced.
 //
 // 1. preset (AMDRadeonVADriver2, VAUveEncoder::EncodePicture)
 //    The driver reads the VCN preset from VAUveEncoder+0xA0 on every frame and,
@@ -70,6 +71,27 @@
 //    interpose library that drops the same key from the specification and
 //    the property gave "Created HW video decoder" at 60 fps on an RX 6900 XT
 //    (15.8.2, Continuity Camera).
+//    E: FaceTime's encoder. avconferenced creates it through
+//       VCPCompressionSessionCreate with usage 42, and on the board-ids
+//       iMacPro1,1 and MacPro7,1 a check sends that session to the T2's
+//       remote encoder (SideCar), which a Mac without a T2 does not have: "No
+//       bridgeOS device available", error -18, no video. The same check makes
+//       VCPCodecCopyProperties report H.264 as unsupported for usage 42, so
+//       AVConference offers HEVC, which the local path refuses ("No HEVC video
+//       encoder support for FaceTime on Mac yet"). Apart from the board-ids
+//       the check returns true only when the BridgeEncode preference is set
+//       and a bridge device really exists. The patch jumps over the two
+//       board-id compares to the release of the board-id string and that
+//       preference check, so the board-id no longer counts:
+//           lea rsi, <board-id 1>       48 8D 35 xx xx xx xx
+//       ->  jmp release ; (dead bytes)  EB 2A xx xx xx xx xx
+//       Then H.264 is reported as supported and the session is a local
+//       VideoToolbox one (h264.gva when hardware is required). Checked on this
+//       code in a test process on a MacPro7,1 board-id (26.7.3, RX 6800 XT):
+//       before, VCPCodec_AVC1 0 and VCPCompressionSessionCreate -18; after,
+//       VCPCodec_AVC1 1 and an H.264 session with hardware required that
+//       encoded 30 frames (tests/ftenc_test.c). Not yet run in a FaceTime
+//       call.
 // 4. hevc10 (AMDRadeonVADriver2, VCN 3 HEVC 10-bit encode)
 //    Two sites in the driver's __text are patched as one unit:
 //    a) Vcn3Encoder::setInputAndOutputFormatParams (+0x2a): for a 10-bit HEVC
@@ -242,7 +264,12 @@ const char* const kCcTargets[] = {"/usr/libexec/ContinuityCaptureAgent",
 // B = VCPDecompressionSessionSetProperty, from the FaceZoom CFStringCompare to
 //     the codec-check jump, and B's target = Apple's DecoderUsage check in the
 //     same function (load of the same key, CFStringCompare, jnz to the
-//     forwarding path).
+//     forwarding path);
+// E = the whole board-id check that VCPCompressionSessionCreate and
+//     VCPCodecCopyProperties call for usage 42 (no symbol; its two board-id
+//     CFStrings, BridgeEncode and the calls checked on 26.7.3 in a live
+//     process, tests/cc_test.c).
+const char kCcSiteName[kCcSites + 1] = "KABE";
 static const CcBuild kCcBuilds[] = {
     {"26.7.2 (25G332), 26.7.3 (25G342)",
      "3EE0D5DE-F382-3E55-B793-03DCA33EB76E",
@@ -306,7 +333,69 @@ static const CcBuild kCcBuilds[] = {
         0x31, 0xd2,                                // xor edx, edx
         0xe8, 0x3c, 0x04, 0x24, 0x00,              // call CFStringCompare
         0x48, 0x85, 0xc0,                          // test rax, rax
-        0x0f, 0x85, 0xac, 0xfd, 0xff, 0xff}}}},    // jnz forwarding path
+        0x0f, 0x85, 0xac, 0xfd, 0xff, 0xff}},      // jnz forwarding path
+      {160,                                        // E at 0x7FF912FA024D
+       {0x55,                                      // +0x00 push rbp
+        0x48, 0x89, 0xe5,                          // +0x01 mov rbp, rsp
+        0x53,                                      // +0x04 push rbx
+        0x50,                                      // +0x05 push rax
+        0xe8, 0x4c, 0xff, 0xff, 0xff,  // +0x06 call the board-id read
+        0x48, 0x85, 0xc0,              // +0x0b test rax, rax
+        0x74, 0x37,                    // +0x0e jz +0x47
+        0x48, 0x89, 0xc3,              // +0x10 mov rbx, rax
+        0x48, 0x8d, 0x35, 0x29, 0xc2, 0xe3,
+        0x2e,                          // +0x13 lea rsi, Mac-7BA5B2D9E42DDD94
+        0x48, 0x89, 0xc7,              // +0x1a mov rdi, rax
+        0x31, 0xd2,                    // +0x1d xor edx, edx
+        0xe8, 0x63, 0xda, 0x25, 0x00,  // +0x1f call CFStringCompare
+        0x48, 0x85, 0xc0,              // +0x24 test rax, rax
+        0x74, 0x4d,                    // +0x27 jz +0x76
+        0x48, 0x8d, 0x35, 0x33, 0xc2, 0xe3,
+        0x2e,                          // +0x29 lea rsi, Mac-27AD2F918AE68F61
+        0x48, 0x89, 0xdf,              // +0x30 mov rdi, rbx
+        0x31, 0xd2,                    // +0x33 xor edx, edx
+        0xe8, 0x4d, 0xda, 0x25, 0x00,  // +0x35 call CFStringCompare
+        0x48, 0x85, 0xc0,              // +0x3a test rax, rax
+        0x74, 0x37,                    // +0x3d jz +0x76
+        0x48, 0x89, 0xdf,              // +0x3f mov rdi, rbx
+        0xe8, 0x10, 0xda, 0x25, 0x00,  // +0x42 call CFRelease
+        0x48, 0x8d, 0x3d, 0x75, 0xcf, 0xe3,
+        0x2e,  // +0x47 lea rdi, BridgeEncode
+        0x48, 0x8d, 0x35, 0xee, 0xc0, 0xe3,
+        0x2e,        // +0x4e lea rsi, com.apple.VideoProcessing
+        0x31, 0xdb,  // +0x55 xor ebx, ebx
+        0x31, 0xd2,  // +0x57 xor edx, edx
+        0xe8, 0xe7, 0xd9, 0x25, 0x00,  // +0x59 call
+                                       // CFPreferencesGetAppBooleanValue
+        0x84, 0xc0,                    // +0x5e test al, al
+        0x74, 0x1e,                    // +0x60 jz +0x80
+        0xbf, 0x03, 0x00, 0x00, 0x00,  // +0x62 mov edi, 3
+        0xe8, 0x27, 0xe3, 0x25, 0x00,  // +0x67 call
+                                       // remote_device_copy_unique_of_type
+        0x48, 0x85, 0xc0,              // +0x6c test rax, rax
+        0x74, 0x18,                    // +0x6f jz +0x89
+        0x48, 0x89, 0xc7,              // +0x71 mov rdi, rax
+        0xeb, 0x03,                    // +0x74 jmp +0x79
+        0x48, 0x89, 0xdf,              // +0x76 mov rdi, rbx
+        0xe8, 0xd9, 0xd9, 0x25, 0x00,  // +0x79 call CFRelease
+        0xb3, 0x01,                    // +0x7e mov bl, 1
+        0x89, 0xd8,                    // +0x80 mov eax, ebx
+        0x48, 0x83, 0xc4, 0x08,        // +0x82 add rsp, 8
+        0x5b,                          // +0x86 pop rbx
+        0x5d,                          // +0x87 pop rbp
+        0xc3,                          // +0x88 retn
+        0x48, 0x8d, 0x35, 0x53, 0xcf, 0xe3,
+        0x2e,        // +0x89 lea rsi, Remote encode ... ignoring
+        0x31, 0xdb,  // +0x90 xor ebx, ebx
+        0xbf, 0x04, 0x00, 0x00, 0x00,  // +0x92 mov edi, 4
+        0x31, 0xc0,                    // +0x97 xor eax, eax
+        0xe8, 0x83, 0xd9, 0x25, 0x00,  // +0x99 call CFLog
+        0xeb, 0xe0},                   // +0x9e jmp +0x80
+       kCcEFirst,
+       2,
+       kCcERelease,
+       0,
+       {0}}}},
     {"15.8.2 (24H232)",
      "7B6360AC-5775-3F01-B253-5F199DD57F7C",
      {{44,  // K at 0x7FF90E44CA4B
@@ -367,7 +456,69 @@ static const CcBuild kCcBuilds[] = {
         0x31, 0xd2,                                // xor edx, edx
         0xe8, 0xa1, 0x2f, 0x24, 0x00,              // call CFStringCompare
         0x48, 0x85, 0xc0,                          // test rax, rax
-        0x0f, 0x85, 0xd4, 0xfe, 0xff, 0xff}}}},    // jnz forwarding path
+        0x0f, 0x85, 0xd4, 0xfe, 0xff, 0xff}},      // jnz forwarding path
+      {160,                                        // E at 0x7FF90E43CBED
+       {0x55,                                      // +0x00 push rbp
+        0x48, 0x89, 0xe5,                          // +0x01 mov rbp, rsp
+        0x53,                                      // +0x04 push rbx
+        0x50,                                      // +0x05 push rax
+        0xe8, 0x4c, 0xff, 0xff, 0xff,  // +0x06 call the board-id read
+        0x48, 0x85, 0xc0,              // +0x0b test rax, rax
+        0x74, 0x37,                    // +0x0e jz +0x47
+        0x48, 0x89, 0xc3,              // +0x10 mov rbx, rax
+        0x48, 0x8d, 0x35, 0x99, 0x21, 0x02,
+        0x33,                          // +0x13 lea rsi, Mac-7BA5B2D9E42DDD94
+        0x48, 0x89, 0xc7,              // +0x1a mov rdi, rax
+        0x31, 0xd2,                    // +0x1d xor edx, edx
+        0xe8, 0x61, 0x8a, 0x25, 0x00,  // +0x1f call CFStringCompare
+        0x48, 0x85, 0xc0,              // +0x24 test rax, rax
+        0x74, 0x4d,                    // +0x27 jz +0x76
+        0x48, 0x8d, 0x35, 0xa3, 0x21, 0x02,
+        0x33,                          // +0x29 lea rsi, Mac-27AD2F918AE68F61
+        0x48, 0x89, 0xdf,              // +0x30 mov rdi, rbx
+        0x31, 0xd2,                    // +0x33 xor edx, edx
+        0xe8, 0x4b, 0x8a, 0x25, 0x00,  // +0x35 call CFStringCompare
+        0x48, 0x85, 0xc0,              // +0x3a test rax, rax
+        0x74, 0x37,                    // +0x3d jz +0x76
+        0x48, 0x89, 0xdf,              // +0x3f mov rdi, rbx
+        0xe8, 0x0e, 0x8a, 0x25, 0x00,  // +0x42 call CFRelease
+        0x48, 0x8d, 0x3d, 0x85, 0x29, 0x02,
+        0x33,  // +0x47 lea rdi, BridgeEncode
+        0x48, 0x8d, 0x35, 0x5e, 0x20, 0x02,
+        0x33,        // +0x4e lea rsi, com.apple.VideoProcessing
+        0x31, 0xdb,  // +0x55 xor ebx, ebx
+        0x31, 0xd2,  // +0x57 xor edx, edx
+        0xe8, 0xe5, 0x89, 0x25, 0x00,  // +0x59 call
+                                       // CFPreferencesGetAppBooleanValue
+        0x84, 0xc0,                    // +0x5e test al, al
+        0x74, 0x1e,                    // +0x60 jz +0x80
+        0xbf, 0x03, 0x00, 0x00, 0x00,  // +0x62 mov edi, 3
+        0xe8, 0xed, 0x91, 0x25, 0x00,  // +0x67 call
+                                       // remote_device_copy_unique_of_type
+        0x48, 0x85, 0xc0,              // +0x6c test rax, rax
+        0x74, 0x18,                    // +0x6f jz +0x89
+        0x48, 0x89, 0xc7,              // +0x71 mov rdi, rax
+        0xeb, 0x03,                    // +0x74 jmp +0x79
+        0x48, 0x89, 0xdf,              // +0x76 mov rdi, rbx
+        0xe8, 0xd7, 0x89, 0x25, 0x00,  // +0x79 call CFRelease
+        0xb3, 0x01,                    // +0x7e mov bl, 1
+        0x89, 0xd8,                    // +0x80 mov eax, ebx
+        0x48, 0x83, 0xc4, 0x08,        // +0x82 add rsp, 8
+        0x5b,                          // +0x86 pop rbx
+        0x5d,                          // +0x87 pop rbp
+        0xc3,                          // +0x88 retn
+        0x48, 0x8d, 0x35, 0x63, 0x29, 0x02,
+        0x33,        // +0x89 lea rsi, Remote encode ... ignoring
+        0x31, 0xdb,  // +0x90 xor ebx, ebx
+        0xbf, 0x04, 0x00, 0x00, 0x00,  // +0x92 mov edi, 4
+        0x31, 0xc0,                    // +0x97 xor eax, eax
+        0xe8, 0x81, 0x89, 0x25, 0x00,  // +0x99 call CFLog
+        0xeb, 0xe0},                   // +0x9e jmp +0x80
+       kCcEFirst,
+       2,
+       kCcERelease,
+       0,
+       {0}}}},
 };
 const CcBuild* cc_build(const char* uuid) {
   for (size_t i = 0; i < sizeof(kCcBuilds) / sizeof(kCcBuilds[0]); i++)
@@ -394,6 +545,9 @@ void build_cc(const CcSite* s, uint8_t out[kCcMaxWrite]) {
     out[0] = 0xe9;
     put32(out + 1, (int64_t)s->tgtDist - (s->off + 5));
     memcpy(out + 5, nop5, 5);
+  } else if (s->n == 2) {  // E: jmp short past the board-id compares
+    out[0] = 0xeb;
+    out[1] = (uint8_t)(int8_t)((int)s->tgtDist - (s->off + 2));
   }
 }
 
@@ -415,6 +569,32 @@ static const char* cc_shape(int k, const CcSite* s) {
                    s->find[12] == 0x85
                ? NULL
                : "site K is not a key load and store";
+  if (k == 3) {
+    // push rbp; mov rbp, rsp; push rbx; push rax; call (the board-id read),
+    // then twice "lea rsi, <board-id>; mov rdi, rax|rbx; xor edx, edx; call;
+    // test rax, rax; jz <match>" with the same call and the same match, then
+    // "mov rdi, rbx; call (CFRelease); lea rdi, <BridgeEncode>"
+    static const uint8_t head[] = {0x55, 0x48, 0x89, 0xe5, 0x53, 0x50, 0xe8};
+    const uint8_t* f = s->find;
+    const int a = kCcEFirst, b = kCcESecond, r = kCcERelease;
+    if (s->n != 2 || s->tgtLen || s->off != a || s->tgtDist != r ||
+        s->len < r + 15 || memcmp(f, head, sizeof(head)) != 0 || f[a] != 0x48 ||
+        f[a + 1] != 0x8d || f[a + 2] != 0x35 || f[a + 7] != 0x48 ||
+        f[a + 8] != 0x89 || f[a + 9] != 0xc7 || f[a + 10] != 0x31 ||
+        f[a + 12] != 0xe8 || f[a + 20] != 0x74 || f[b] != 0x48 ||
+        f[b + 1] != 0x8d || f[b + 2] != 0x35 || f[b + 7] != 0x48 ||
+        f[b + 8] != 0x89 || f[b + 9] != 0xdf || f[b + 10] != 0x31 ||
+        f[b + 12] != 0xe8 || f[b + 20] != 0x74 || a + 22 != b || b + 22 != r ||
+        f[r] != 0x48 || f[r + 1] != 0x89 || f[r + 2] != 0xdf ||
+        f[r + 3] != 0xe8 || f[r + 8] != 0x48 || f[r + 9] != 0x8d ||
+        f[r + 10] != 0x3d)
+      return "site E is not the board-id check";
+    // both compares call the same function and jump to the same match
+    if (a + 17 + get32(f + a + 13) != b + 17 + get32(f + b + 13) ||
+        a + 22 + (int8_t)f[a + 21] != b + 22 + (int8_t)f[b + 21])
+      return "site E: the two board-id compares differ";
+    return NULL;
+  }
   if (k == 1) {
     int8_t rel = (int8_t)((int)s->tgtDist - (s->off + 2));
     if (s->n != 7 || s->tgtLen || s->find[s->off] != 0x3d ||
@@ -455,8 +635,8 @@ const CcBuild* cc_locate(const CcBuild* b, const uint8_t* text, size_t size,
         at = i;
       }
     if (m != 1) {
-      snprintf(why, whyLen, "site %c found %zu times, expected once", "KAB"[k],
-               m);
+      snprintf(why, whyLen, "site %c found %zu times, expected once",
+               kCcSiteName[k], m);
       return NULL;
     }
     if (s->tgtLen && (at + s->tgtDist + s->tgtLen > size ||
@@ -477,6 +657,15 @@ const CcBuild* cc_locate(const CcBuild* b, const uint8_t* text, size_t size,
   if (get32(K->find + 13) !=
       get32(A->find + slot_load(A->find, A->len, A->tgtDist) + 3)) {
     snprintf(why, whyLen, "site A does not remove the key K stores");
+    return NULL;
+  }
+  // E's board-id compares call the CFStringCompare that B's check calls
+  const CcSite* E = &b->site[3];
+  uint64_t cmpB = sites[2] + B->tgtDist + 23 + (int64_t)get32(B->tgt + 19);
+  uint64_t cmpE =
+      sites[3] + kCcEFirst + 17 + (int64_t)get32(E->find + kCcEFirst + 13);
+  if (cmpB != cmpE) {
+    snprintf(why, whyLen, "site E does not call B's CFStringCompare");
     return NULL;
   }
   return b;

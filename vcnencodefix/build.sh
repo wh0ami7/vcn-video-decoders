@@ -74,8 +74,11 @@ xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefin
 $B/obj/wide_test | tail -1
 # CC_IMAGES: optional VideoProcessing copies (taken out of a dyld shared cache) whose sites are checked too
 xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
-  tests/cc_test.c tests/run_cc.s tool/patches.c -framework VideoToolbox -o $B/obj/cc_test
+  tests/cc_test.c tests/run_cc.s tool/patches.c -framework VideoToolbox -framework CoreFoundation -o $B/obj/cc_test
 $B/obj/cc_test ${=CC_IMAGES:-} | tail -1
+# ftenc_test encodes on the GPU and needs a Mac Pro / iMac Pro board-id: built here, run by hand
+xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror tests/ftenc_test.c tool/patches.c -framework VideoToolbox \
+  -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o $B/obj/ftenc_test
 xcrun clang -arch x86_64 -O1 -g -Wall -Wextra -Werror -fblocks -fsanitize=address,undefined -fno-sanitize-recover=undefined \
   tests/hevc10_test.c tool/patches.c -o $B/obj/hevc10_test
 $B/obj/hevc10_test | tail -1
