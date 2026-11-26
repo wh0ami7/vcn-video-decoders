@@ -65,6 +65,27 @@ engine the app runs, the two decoder bundles and VCNEncodeFix, behind two script
 `--yes` skips the question, `--force` is the app's "Install anyway" (a driver build that is not validated can hang
 the GPU). Both scripts refuse an incomplete folder and a bad `--efi` name before anything is changed.
 
+## Why an install or uninstall can be undone at the next boot
+
+`com.apple.MobileSoftwareUpdate` (Software Update's staging part) unmounts the system volume a few seconds after boot
+and reverts it to a snapshot; every snapshot newer than the target is deleted, the one `bless` just set as the root
+among them (kernel log: `volume will revert to snapshot com.apple.os.update-...`, `free'ing allocated extents for
+snap_xid ...`). The Mac then boots Apple's own system, and what was installed or removed has no effect. It happens
+while Software Update has an update staged (`AutomaticDownload` on, a `com.apple.os.update-MSUPrepareUpdate` snapshot).
+
+The engine therefore refuses to change the volume when it holds another macOS than the one running, when it does not
+match the snapshot the Mac boots, when the volume is set to revert to another snapshot, or (install, repair) when an
+update is staged; after `bless` it checks that the new snapshot is the root, that it is a system that boots, and that
+no revert points elsewhere, and otherwise sets the root snapshot back. `engine.sh uninstall --sealed` (`./uninstall.sh
+--sealed`) puts the Mac back on Apple's sealed snapshot without touching the volume. To stop the staging:
+
+```bash
+sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticDownload -bool false
+sudo softwareupdate --schedule off
+```
+
+Every run is logged to `/var/log/vcn-installer.log`. `tests/enginetest.sh` runs the engine against a made-up volume.
+
 ## Why /System and not /Library
 
 VideoToolbox scans `/System/Library/Video/Plug-Ins` without a code-signature check. `/Library/Video/Plug-Ins`

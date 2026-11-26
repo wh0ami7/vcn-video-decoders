@@ -7,6 +7,9 @@
 #   ./uninstall.sh --encode-fix --efi disk6s1
 #                                     ... and its clock-floor kext from that OpenCore EFI partition
 #   ./uninstall.sh --encode-fix-only  only VCNEncodeFix, leave the decoders
+#   ./uninstall.sh --sealed           put the Mac back on Apple's own sealed snapshot of this macOS instead of editing the
+#                                     system volume: use it when the plain uninstall refuses because the volume holds
+#                                     another macOS than the one that runs (an update was applied to it)
 #   ./uninstall.sh --all              the decoders and VCNEncodeFix (the service)
 # Only the two decoder bundles are ever deleted from /System. A reboot is needed afterwards; the script says so.
 #
@@ -50,10 +53,11 @@ confirm() {  # question
   local a; read -r "a?$1 [y/N] "; [[ $a == [yY]* ]]
 }
 
-yes=0 enc=0 encOnly=0 efi=""
+yes=0 enc=0 encOnly=0 efi="" engArgs=()
 while (( $# )); do
   case $1 in
     --yes|-y) yes=1 ;;
+    --sealed) engArgs+=(--sealed) ;;
     --all|--encode-fix) enc=1 ;;
     --encode-fix-only) enc=1 encOnly=1 ;;
     --efi) (( $# >= 2 )) || die "--efi needs a partition such as disk6s1"
@@ -77,7 +81,7 @@ need_root $0 "$@"
 rebootNeeded=0
 if (( ! encOnly )); then
   step "Removing the decoders"
-  /bin/zsh $here/engine.sh uninstall --res $here || die "removing the decoders failed (the encoding fix was not touched)"
+  /bin/zsh $here/engine.sh uninstall $engArgs --res $here || die "removing the decoders failed (the encoding fix was not touched)"
   rebootNeeded=1
 fi
 if (( enc )); then

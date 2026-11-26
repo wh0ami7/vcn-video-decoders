@@ -91,6 +91,7 @@ check "decoder sessions release the driver once, also after failures and a \
 stuck GPU; hidden frames keep their picture; a VP9 reference more than 2x \
 smaller is refused and a failed frame empties its slots (made-up driver)" sessions
 check "sessiontest notices when those VP9 rules are broken (3 damaged builds)" ./mutants.sh
+check "the installer engine refuses a volume that is not the running system, checks the snapshot it blesses and puts the root back when it is wrong (made-up volume)" ./enginetest.sh
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"
