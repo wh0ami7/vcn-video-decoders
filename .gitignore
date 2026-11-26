@@ -30,6 +30,7 @@ build/
 /vtvp9/vtvp9test
 /tools/driveruuid
 /tools/vtchurn
+/tools/vtdiag
 /tools/poollayout
 
 # Encodefix local outputs
@@ -61,3 +62,4 @@ venv/
 compile_commands.json
 .cache/
 artifacts/
+/tools/diag/featdump

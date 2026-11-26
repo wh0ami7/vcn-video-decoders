@@ -20,6 +20,7 @@ programs are built with the address and undefined-behaviour sanitizers.
 | `plugintest-av1`, `plugintest-vp9` | Each plug-in's VideoToolbox side, with the decoder session replaced by a stand-in: factory and session start, codec check, shown and dropped frames, a sample of only a hidden frame (its picture, no error), a missing reference (`kVTVideoDecoderReferenceMissingErr`), calls made from inside the output callback, invalidate, finalize from the output callback |
 | `waittest` | The wait for one decode command (`vcn_wait_command`) against a made-up driver: done, firmware error, driver error, and a command that never finishes, which must time out |
 | `sessiontest-av1`, `sessiontest-vp9` | Both decoder sessions against a made-up driver: everything is released once and in Apple's order (DeleteContexts, FreeBitstreamBufferPool, DeleteDriver, AVD_DestroyAVDAccelerator, the service), also after each failed create step, after a stuck command and on a driver without the destroy export. With a second clip: a hidden frame sent alone keeps its picture for the plug-in, and a frame whose reference was never decoded is a reference failure |
+| `mutants.sh` | `sessiontest-vp9` fails on each of three damaged copies of `vcnvp9.c`: the 2x-smaller-reference check removed, the emptying of a failed frame's slots removed, and the check made to refuse a 2x reference | 
 | `check_lists.sh` | `installer/validated-builds.json` names the same drivers as `kValidatedDrivers` in `vcnav1/vcnav1.c` and `vcnvp9/vcnvp9.c`: a build marked usable must be in the C lists, a driver in the C lists must be marked usable, and one driver may not be usable for one build and `false` for another |
 
 ## Programs that talk to the driver or the GPU
@@ -34,6 +35,8 @@ the video block can hang the GPU and the Mac then has to be reset.
 | `vcnvp9/decode_vp9` | `vcnvp9/build.sh` | yes | `VCNVP9_SESSION=vp9` and `VCNVP9_ALLOW_GPU=yes-i-know-it-can-hang` |
 | `vtav1/vtav1test`, `vtvp9/vtvp9test` | `vcnav1/build.sh`, `vtvp9/build.sh` | yes | nothing: a decode run is armed |
 | `tools/vtchurn` | `vcnav1/build.sh` | yes | nothing: every session decodes |
+| `tools/diag/selftest.py --gpu` | the decoders' integration test: every stream in `tests/media` on the GPU with the freshly built plug-ins, each required to be `BIT-EXACT` against a CPU decode (PyAV), the spatial-SVC stream `REFUSED` | yes | nothing; exit 3 when PyAV is missing |
+| `tools/vtdiag` | `clang -O1 tools/vtdiag.c -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework CoreFoundation -o tools/vtdiag` | low: hardware H.264 and HEVC encodes (up to 7680x4320) and an AV1 decoder session; `-psnr10` adds a Main10 round trip | nothing; exit 2 when a path that is offered fails |
 | `vcnav1/probe_ctx` | `vcnav1/build.sh` | low: it opens one AV1 context on the first VCN instance and decodes nothing | nothing |
 | `tools/driveruuid` | `vcnav1/build.sh` | no: it only loads the driver's code to read its UUID | nothing |
 | `tools/dryrun.py`, `tools/dryrun_vp9.py` | lldb scripts | the driver's own session setup goes out; our commands are stopped before the kernel | the scripts arm the program themselves |
