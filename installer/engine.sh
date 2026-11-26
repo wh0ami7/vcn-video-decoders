@@ -371,10 +371,16 @@ EOF
   local name
   name=$(snapshot_name "$vol" "$base")
   [[ -n "$name" ]] || { echo "snapshot $base is not on $vol; refusing to change the volume" >&2; return 1; }
-  d=$(mount_snapshot "$vol" "$name") || { echo "could not mount snapshot $name to compare; refusing" >&2; return 1; }
   live=$(volume_fingerprint "$MNT")
-  snap=$(volume_fingerprint "$d")
-  unmount_snapshot "$d"
+  if [[ "$base" == "$(booted_snapshot)" ]]; then
+    # The snapshot the Mac booted is already mounted read-only at /, and APFS refuses to mount the same snapshot a
+    # second time (mount_apfs: "Resource busy", rc 75; seen on Sequoia 15.8.3 and Tahoe 26.7.3). / is that snapshot.
+    snap=$(volume_fingerprint /)
+  else
+    d=$(mount_snapshot "$vol" "$name") || { echo "could not mount snapshot $name to compare; refusing" >&2; return 1; }
+    snap=$(volume_fingerprint "$d")
+    unmount_snapshot "$d"
+  fi
   if [[ -z "$live" || "$live" != "$snap" ]]; then
     cat >&2 <<EOF
 The system volume is not the system the Mac boots from (root snapshot $name):
