@@ -42,7 +42,7 @@ From 1.5.0 the cc fix also covers FaceTime's own video encoder:
 |---|---|---|
 | On a Mac Pro (MacPro7,1) or iMac Pro (iMacPro1,1) SMBIOS, FaceTime's encoder is sent to the T2 chip, which a Mac without a T2 does not have | no outgoing video in FaceTime; the log shows `No bridgeOS device available` and `Failed to create remote video encoder with usage 42 on macOS, err = -18!` | **vcnencodefix** service (*cc*) |
 
-From 1.4.0 it also makes 10-bit HEVC (Main10) hardware encoding work, on macOS 26.7.3 only:
+From 1.4.0 it also makes 10-bit HEVC (Main10) hardware encoding work, on macOS 26.7.3 and 15.8.2 (from 1.5.1):
 
 | Problem | What you see | Fixed by |
 |---|---|---|
@@ -58,7 +58,8 @@ Measured on an RX 6800 XT (26.7.3), 1080p Main10: PSNR Y 57.4, U 54.9, V 57.3 dB
   checks the exact build of the Apple file it changes and stays off on any other build, so a macOS update cannot break
   anything; it only switches the fix off until a new version supports it. The cc fix knows the VideoProcessing of
   **15.8.2** and **26.7.2/26.7.3** only; on 14.8.9 and 15.8.3 it stays off (`status` prints the build it found).
-  The hevc10 fix knows the AMDRadeonVADriver2 of **26.7.3** only and stays off on the others the same way.
+  The hevc10 fix knows the AMDRadeonVADriver2 of **26.7.3** and **15.8.2/15.8.3** (same binary) and stays off on
+  the others the same way.
 - OpenCore with **Lilu 1.7.0 or newer** (for the kext).
 - For the service: **SIP Debugging Restrictions** off (bit `0x4`, `CSR_ALLOW_TASK_FOR_PID`,
   in `csr-active-config`). The service patches Apple's encoder process (and the video-call processes) the way a debugger
@@ -180,7 +181,7 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   process (where macOS runs hardware encoders) it changes a few instructions in that process's memory, the way a
   debugger sets a breakpoint. Files on disk, the system volume and other processes are never touched.
   - *preset*: the driver reads the preset from a field nobody sets; the read becomes the constant "speed".
-  - *hevc10* (26.7.3 only): the AMD library told the video engine the input was 8-bit NV12 for a 10-bit session and never passed the chroma quantizer offset the stream header declares for 10 bits (Cr -3). The service changes those two places in the driver, together or not at all. 8-bit and H.264 sessions are unaffected.
+  - *hevc10* (26.7.3, and from 1.5.1 15.8.2): the AMD library told the video engine the input was 8-bit NV12 for a 10-bit session and never passed the chroma quantizer offset the stream header declares for 10 bits (Cr -3). The service changes those two places in the driver, together or not at all. 8-bit and H.264 sessions are unaffected.
   - *wide*: just before the statistics job is sent to the GPU, the work is split into more, smaller thread groups
     (for example 2 x 160 threads instead of 1 x 320 for 5120 wide). The total work is the same, and below 4097 pixels
     wide nothing changes at all.
@@ -217,9 +218,12 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
   first frame about 260 ms after the start (measured with 1.0.1 in OBS: patched 148 ms after the start). If a frame wider than 4096 is sent before the patch, that frame stalls
   the GPU for a few seconds (version 1.0.0 looked for new processes only every 250 ms and lost that race in OBS at
   5120x2160).
-- HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 only; 1080p Main10 measured at
-  PSNR Y 57.4, U 54.9, V 57.3 dB on an RX 6800 XT). Main10 was not run on Sequoia (the fix is off there anyway) or on an
-  RX 6900 XT. Sizes accepted by macOS are unchanged.
+- HEVC Main only unless `-vcnhevc10` is set and the `hevc10` service fix applies (26.7.3 and, from 1.5.1, 15.8.2; 1080p Main10 measured at
+  PSNR Y 57.4, U 54.9, V 57.3 dB on an RX 6800 XT on 26.7.3). Main10 was not run on Sequoia (the code was checked
+  in Hopper, and each place is found once in the 15.8.2 driver, but VideoToolbox offers Main10 only with the kext's
+  gate) or on an RX 6900 XT. Sizes accepted by macOS are unchanged: HEVC up to 7680x4320 was encoded in hardware on
+  an RX 6900 XT (15.8.2) with `tools/vtdiag`; 8192x4320 is past the video engine's limit. There is no hardware AV1 or
+  VP9 encoder on these cards (VideoToolbox lists none), so those cannot be fixed here.
 - The cc fix was run with a real iPhone camera on an RX 6900 XT (15.8.2, version 1.3.0: `Created HW video decoder`,
   HEVC 1920x1088 decoded in 5 to 9 ms a frame). FaceTime calls were not tested, with or without it. The encoder part
   (1.5.0) was run on its exact code in a test process on a MacPro7,1 SMBIOS (26.7.3, RX 6800 XT,
@@ -250,7 +254,7 @@ Apps that are open keep the fix until you quit them; the kext stays loaded until
 - `cc unavailable: VideoProcessing build ... is not a validated build`: the cc fix does not know this macOS
   build yet; the encoder fixes are not affected.
 - `hevc10 unavailable: AMDRadeonVADriver2 build ... is not a validated build`: the 10-bit fix does not know this
-  macOS build (only 26.7.3); the kext keeps Main10 back (`VCNHEVC10` = `off: service says the driver patch is not
+  macOS build (only 26.7.3 and 15.8.2/15.8.3); the kext keeps Main10 back (`VCNHEVC10` = `off: service says the driver patch is not
   active`) and the other fixes are not affected.
 - The service log is full of `task_for_pid failed ((os/kern) failure)` and nothing gets patched: SIP's Debugging
   Restrictions are on (see Requirements). From 1.2.2 the line ends with ": SIP Debugging Restrictions are on" and

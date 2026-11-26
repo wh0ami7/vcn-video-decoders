@@ -96,11 +96,29 @@ int main(void) {
     printf("FAIL: struct array sizes do not match constants\n");
     fails++;
   }
-  // Site A rip-relative vmovsd loads (bytes 16..23 and 26..33) must stay identical.
-  if (memcmp(b->fmtFind + 16, b->fmtRepl + 16, 8) != 0 ||
-      memcmp(b->fmtFind + 26, b->fmtRepl + 26, 8) != 0) {
-    printf("FAIL: site A rip-relative loads differ between find and repl\n");
-    fails++;
+  // Every validated build: site A's rip-relative vmovsd loads (bytes 16..23
+  // and 26..33) must stay identical, and the table holds the build.
+  static const char* const kUuids[] = {"1181E2CA-31B3-3DF0-90E2-3AE70552D753",
+                                       "5D90FED3-BCBF-3475-9F4B-8FC00026D3AB"};
+  for (size_t i = 0; i < sizeof(kUuids) / sizeof(kUuids[0]); i++) {
+    const Hevc10Build* v = hevc10_build(kUuids[i]);
+    if (!v) {
+      printf("FAIL: %s missing from table\n", kUuids[i]);
+      fails++;
+      continue;
+    }
+    if (memcmp(v->fmtFind + 16, v->fmtRepl + 16, 8) != 0 ||
+        memcmp(v->fmtFind + 26, v->fmtRepl + 26, 8) != 0) {
+      printf("FAIL: %s: site A rip-relative loads differ between find and repl\n",
+             v->macos);
+      fails++;
+    }
+    // Both sites leave the code after them untouched: what is written is not
+    // longer than what was found.
+    if (memcmp(v->fmtFind, v->fmtRepl, 1) == 0 && v->fmtRepl[0] == 0) {
+      printf("FAIL: %s: empty replacement\n", v->macos);
+      fails++;
+    }
   }
 
   // Live shared cache check (when this host has a validated AMDRadeonVADriver2)

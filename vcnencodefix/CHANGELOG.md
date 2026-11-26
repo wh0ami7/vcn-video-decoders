@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.5.1 (not released)
+
+- *cc* also patches `AirPlayXPCHelper`, the AirPlay sender's video encoder host. For an extended display or
+  mirroring it asks `VCPCompressionSessionCreate` for usage 42, and on a MacPro7,1 / iMacPro1,1 board-id the check
+  that site E jumps over sent that to the T2 (`No bridgeOS device available`, error -18, black screen on the
+  receiver). The service now patches it the way it patches `ContinuityCaptureAgent` and `avconferenced`; no new
+  site, the same VideoProcessing image. Not run against an AirPlay receiver.
+- *hevc10* now knows the `AMDRadeonVADriver2` of macOS 15.8.2 (24H232, UUID
+  `5D90FED3-BCBF-3475-9F4B-8FC00026D3AB`, the same binary as 15.8.3). Its two places are the same code as in
+  26.7.3 (`Vcn3Encoder::setInputAndOutputFormatParams` +0x2a and `AVDVcn3HevcEncDataProcessor::setupDeblocking`
+  +0x83: same instructions, same struct offsets, only three rip-relative constant addresses differ). Read in
+  Hopper; `tests/hevc10_test.c` finds each place exactly once in this Mac's running driver. Main10 itself was not
+  run on a GPU here: VideoToolbox offers it only with the kext's `-vcnhevc10` gate, which this Mac does not have,
+  so the 10-bit picture is unmeasured on 15.8.2. The service still patches only 10-bit input.
+- New `tools/vtdiag` (in the repository's `tools/`): checks the hardware decoders, hardware H.264 and HEVC encodes
+  up to 7680x4320 and, with `-psnr10`, a Main10 round trip with PSNR. AV1 and VP9 are reported as having no
+  hardware encoder (VCN 2/3 cannot encode them). 8192x4320 HEVC is past the video engine's limit and is not
+  attempted.
+
 ## 1.5.0 (not released)
 
 - *cc* also fixes FaceTime's video encoder on a Mac Pro (MacPro7,1) or iMac Pro (iMacPro1,1) SMBIOS. On those
