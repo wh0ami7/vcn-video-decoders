@@ -193,6 +193,21 @@ static void on_output(void* vctx, CVPixelBufferRef pb, const VP9Parser* p,
         CC_MD5_Update(&m, row, cw);
       }
     }
+  // VCNVP9_DUMP_YUV=<file>: also append every frame as planar I420 (8-bit), to compare pixels with a
+  // reference decoder when an MD5 differs (tools/diag/pixdiff.py).
+  const char* dump = getenv("VCNVP9_DUMP_YUV");
+  if (dump && !ten) {
+    FILE* df = fopen(dump, "ab");
+    if (df) {
+      for (uint32_t r = 0; r < h; r++) fwrite(y + r * ys, 1, w, df);
+      for (int pl = 0; pl < 2; pl++)
+        for (uint32_t r = 0; r < ch; r++) {
+          for (uint32_t i = 0; i < cw; i++) row[i] = uv[r * uvs + 2 * i + pl];
+          fwrite(row, 1, cw, df);
+        }
+      fclose(df);
+    }
+  }
   free(row);
   IOSurfaceUnlock(s, kIOSurfaceLockReadOnly, NULL);
   uint8_t dg[16];

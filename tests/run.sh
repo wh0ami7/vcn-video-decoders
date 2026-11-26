@@ -81,12 +81,16 @@ sessions() {
     media/av1/av1-1-b8-05-mv.ivf > "${B}/sessiontest-av1.txt" &&
     "${B}/sessiontest-vp9" media/vp9/vp90-2-12-droppable_1.ivf \
       media/vp9-invalid/invalid-vp90-2-09-aq2.webm.ivf.s3984_r01-05_b6-.ivf \
+      media/vp9/vp90-2-22-svc_1280x720_3.ivf \
+      media/vp9/vp90-2-13-mv-with-scaling.ivf \
       > "${B}/sessiontest-vp9.txt" ||
     { cat "${B}/sessiontest-av1.txt" "${B}/sessiontest-vp9.txt" 2>/dev/null |
         grep -v ^PASS; return 1; }
 }
 check "decoder sessions release the driver once, also after failures and a \
-stuck GPU; hidden frames keep their picture (made-up driver)" sessions
+stuck GPU; hidden frames keep their picture; a VP9 reference more than 2x \
+smaller is refused and a failed frame empties its slots (made-up driver)" sessions
+check "sessiontest notices when those VP9 rules are broken (3 damaged builds)" ./mutants.sh
 
 if (( ${#failed} )); then
   echo "FAILED: ${(j:, :)failed}"

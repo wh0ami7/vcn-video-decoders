@@ -557,7 +557,7 @@ static bool seq_supported(const AV1Seq* s) {
          !s->mono_chrome && s->subsampling_x == 1 && s->subsampling_y == 1;
 }
 
-static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
+static int decode_one(void* vctx, AV1Parser* p, AV1ParseResult kind) {
   VcnAV1* d = vctx;
   const AV1Frame* h = &p->fh;
   if (kind == AV1_PARSE_SHOW_EXISTING) {
@@ -715,6 +715,20 @@ int vcnav1_configure(VcnAV1* d, const uint8_t* obus, size_t size) {
     return VCNAV1_UNSUPPORTED;
   }
   return 0;
+}
+
+// A frame that was not decoded leaves the reference slots it should have
+// refreshed holding older pictures. Frames that predict from them would decode
+// without an error and show a wrong picture, so the slots are emptied: those
+// frames are refused too until one refreshes them again.
+static int on_frame(void* vctx, AV1Parser* p, AV1ParseResult kind) {
+  int r = decode_one(vctx, p, kind);
+  if (r && kind == AV1_PARSE_FRAME_READY) {
+    for (int i = 0; i < 8; i++)
+      if (p->fh.refresh_frame_flags & (1u << i)) p->ref[i].valid = 0;
+    release_slot_refs((VcnAV1*)vctx);
+  }
+  return r;
 }
 
 int vcnav1_decode(VcnAV1* d, const uint8_t* tu, size_t size, int64_t userTag,

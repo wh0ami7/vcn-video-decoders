@@ -35,6 +35,26 @@ decode messages and submit them through the driver, then hand the frames back to
 VP9 is not in Apple's driver at all. `vcnvp9` builds the VCN VP9 messages itself, following the
 same layout as Mesa's `ac_vcn_dec.h`.
 
+## Decoders 0.3.6
+
+- A frame the video engine cannot decode bit-exactly is refused, and so is everything predicted from it. Found with
+  `tools/diag/decode.py`, which compares every frame with a CPU decode: `vp90-2-22-svc_1280x720_3.ivf` (spatial
+  SVC) decoded without an error but showed a wrong picture. Its 1280x720 layer predicts from a 320x180 reference,
+  4x smaller; the engine predicts from a reference up to 2x smaller bit-exactly (the 320x180 to 640x360 layer
+  was identical to libvpx), and from a smaller one it reads only the first rows of the reference and repeats
+  them below, so more than half of the frame differs and the error carries into every frame predicted from it.
+  VP9 now refuses a frame with a reference more than 2x smaller than the frame. The limit was found by comparing
+  pictures, not read from the firmware; ratios between 2x and 4x were not tried and are refused too. Such a stream
+  needs a software decoder (Safari and Chrome have one).
+- A frame that fails for any reason now empties the reference slots it should have refreshed, in both plug-ins.
+  Before, later frames kept predicting from the older pictures in those slots and showed wrong pictures without an
+  error; now they are refused (`kVTVideoDecoderReferenceMissingErr`) until a frame refreshes the slots, so the
+  client falls back to another decoder or waits for a key frame.
+- `tools/diag/` (python3): V4L2 field coverage of the parsers, which coding tools the test streams use, and a
+  bit-exact check of every stream against a CPU decode. 14 of the 15 streams match; the SVC one is refused.
+- `VCNVP9_DUMP_YUV=<file>` makes `decode_vp9` append every frame as I420, and `tools/diag/pixdiff.py` shows where
+  the pixels differ from a CPU decode.
+
 ## Decoders 0.3.5
 
 - The `stats` log line now counts a frame as slow against the stream's own frame time. Before,
@@ -101,7 +121,7 @@ no GPU (see `tests/README.md`).
 macOS's hardware encoder leaves three things wrong on Navi 21: the video engine is never asked for clocks and
 can stay at its lowest speed for a whole recording, no speed preset is ever selected, and every HEVC frame wider
 than 4096 runs a small GPU job with more threads per group than the GPU allows, which stalls it.
-**VCNEncodeFix 1.3.0** fixes all three with a background service (patches the encoder process in memory, no reboot)
+**VCNEncodeFix 1.5.1** fixes all three with a background service (patches the encoder process in memory, no reboot)
 and an optional Lilu kext in the OpenCore EFI (clock floor while encoding). It never touches the system volume.
 From 1.3.0 the same service also lets Continuity Camera (an iPhone as the Mac's camera) and FaceTime calls decode
 the incoming HEVC video on the GPU: it patches each `ContinuityCaptureAgent` and `avconferenced` in memory, in place
@@ -282,7 +302,14 @@ python3 tools/mkvp9.py /tmp/v.ivf 640 360 30
 ## Checking support
 
 `VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9)` returns false until the app calls
-`VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)`. Safari and Chrome do that.
+`VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9)`. Safari, WebKit, Chrome, Firefox and FFmpeg do that.
+
+This is Apple's own gate, read in VideoToolbox of macOS 15.8.2: that call sets a process-wide flag; when a decoder
+session is made, VideoToolbox adds `AllowVP9Decode` to the decoder specification only if the flag is set, and for
+`vp09` it refuses to list any decoder (Apple's or this one) without that key (-12906,
+`kVTCouldNotFindVideoDecoderErr`). Only `VTDecoderXPCService`, the remote decode server, skips the check. AV1 has no
+such gate: a client that asks for nothing, or for hardware, gets this decoder. `tools/vtdiag` shows both: AV1 on
+hardware with no specification, VP9 refused before the call and on hardware after it.
 
 ## Not included
 

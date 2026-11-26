@@ -739,8 +739,8 @@ static int submit(VcnVP9* d, VP9Params* prm) {
   return 0;
 }
 
-static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
-                    const uint8_t* data, size_t size) {
+static int decode_one(void* vctx, VP9Parser* p, VP9ParseResult kind,
+                      const uint8_t* data, size_t size) {
   VcnVP9* d = vctx;
   const VP9Frame* h = &p->fh;
   if (kind == VP9_PARSE_SHOW_EXISTING) {
@@ -776,6 +776,22 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
       if (r->bit_depth != h->bit_depth) {
         snprintf(d->err, sizeof(d->err), "%d-bit reference for a %d-bit frame",
                  r->bit_depth, h->bit_depth);
+        return -1;
+      }
+      // The video engine predicts from a reference up to twice as small as
+      // the frame bit-exactly (vp90-2-22-svc_1280x720_3, frame 2: 320x180 for
+      // 640x360). From one smaller than that (frame 3: 320x180 for 1280x720,
+      // 4x) it reads only the first rows of the reference and repeats them
+      // below, a picture that differs from libvpx in more than half the frame
+      // and goes on into every frame predicted from it. A wrong picture is
+      // worse than no picture: refuse the frame, and the client falls back to
+      // another decoder. A reference that is merely present is refused too:
+      // which of the three a block predicts from is known only to the engine.
+      if (2 * r->width < h->width || 2 * r->height < h->height) {
+        snprintf(d->err, sizeof(d->err),
+                 "reference %ux%u is more than 2x smaller than the %ux%u frame: "
+                 "the video engine does not scale it bit-exactly",
+                 r->width, r->height, h->width, h->height);
         return -1;
       }
     }
@@ -853,6 +869,22 @@ static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
     d->hidden = CVPixelBufferRetain(target);
   }
   return 0;
+}
+
+// A frame that was not decoded leaves the reference slots it should have
+// refreshed holding older pictures. Frames that predict from them would decode
+// without an error and show a wrong picture, so the slots are emptied: those
+// frames are refused too ("missing reference") until a frame that refreshes
+// them again, which is how libvpx treats a frame it could not decode.
+static int on_frame(void* vctx, VP9Parser* p, VP9ParseResult kind,
+                    const uint8_t* data, size_t size) {
+  int r = decode_one(vctx, p, kind, data, size);
+  if (r && kind == VP9_PARSE_DECODE) {
+    for (int i = 0; i < 8; i++)
+      if (p->fh.refresh_frame_flags & (1u << i)) p->ref[i].valid = false;
+    recount_refs((VcnVP9*)vctx);
+  }
+  return r;
 }
 
 int vcnvp9_decode(VcnVP9* d, const uint8_t* chunk, size_t size, int64_t tag,
