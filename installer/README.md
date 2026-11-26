@@ -48,6 +48,23 @@ partitions, which also adds `VCNEncodeFloor.kext` to that OpenCore EFI (the part
 unmounted again; it must hold `EFI/OC/OpenCore.efi`, `config.plist` and `Lilu.kext`; `config.plist` gets a dated
 backup and is checked after the edit). **Remove** undoes the same scope.
 
+## Command-line installer
+
+`build-cli.sh` (after `vtav1/build.sh`, `vtvp9/build.sh` and `vcnencodefix/build.sh`, or with the checked-in
+`vcnencodefix/prebuilt/`) makes `build/vcn-video-decoders-cli-<version>/` and a `.tar.gz` with its `.sha256`: the same
+engine the app runs, the two decoder bundles and VCNEncodeFix, behind two scripts.
+
+```bash
+./install.sh --check               # the preflight; changes nothing, needs no root
+./install.sh                       # asks, then installs the decoders (sudo); reboot afterwards
+./install.sh --encode-fix          # ... and the VCNEncodeFix service (no reboot for the service)
+./install.sh --encode-fix --efi disk6s1   # ... and its kext into that OpenCore EFI
+./uninstall.sh                     # removes the decoders; --encode-fix, --encode-fix-only or --all for VCNEncodeFix
+```
+
+`--yes` skips the question, `--force` is the app's "Install anyway" (a driver build that is not validated can hang
+the GPU). Both scripts refuse an incomplete folder and a bad `--efi` name before anything is changed.
+
 ## Why /System and not /Library
 
 VideoToolbox scans `/System/Library/Video/Plug-Ins` without a code-signature check. `/Library/Video/Plug-Ins`
