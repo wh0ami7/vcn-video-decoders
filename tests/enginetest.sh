@@ -71,6 +71,7 @@ new_world() { # with-ours-in-live-and-snapshot
   ditto $W/live $W/snaps/$BOOT_NAME
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' $U_ORIG $ORIG_NAME 100 0 0 0 $U_BOOT $BOOT_NAME 200 1 1 1 > $W/snaps.tsv
   echo $U_BOOT > $W/booted
+  echo $BOOT_NAME > $W/booted_name
   : > $W/mounts; : > $W/calls
   stubs
 }
@@ -103,6 +104,8 @@ EOS
 W=${VCNVT_TEST_MNT:h}
 name=$2; dir=${@[-1]}
 [[ -d $W/snaps/$name ]] || exit 1
+# the snapshot the Mac booted is mounted at / already: APFS refuses a second mount (mount_apfs: Resource busy, rc 75)
+[[ $name == $(<$W/booted_name) ]] && exit 75
 rmdir $dir; ln -s $W/snaps/$name $dir
 EOS
   cat > $W/bin/umount <<'EOS'
@@ -147,7 +150,7 @@ EOS
 
 run_engine() { # command [env...]   (ENGINE_ARGS: more arguments for the engine)
   local cmd=$1; shift
-  env "$@" VCNVT_TEST_BIN=$W/bin VCNVT_TEST_MNT=$W/mnt1 VCNVT_FAKE_BUILD=24TEST \
+  env "$@" VCNVT_TEST_BIN=$W/bin VCNVT_TEST_MNT=$W/mnt1 VCNVT_TEST_ROOT=$W/snaps/$BOOT_NAME VCNVT_FAKE_BUILD=24TEST \
     zsh $ENGINE $cmd ${ENGINE_ARGS:-} --res "$RES" > $W/out.txt 2>&1
   return $?
 }

@@ -59,7 +59,8 @@ VP9=VP9VCNDecoder.bundle
 BUILDS_JSON=$RES/validated-builds.json
 PLUGDIR=System/Library/Video/Plug-Ins
 MNT=/System/Volumes/Update/mnt1
-if [[ ${VCNVT_TESTING:-0} -eq 1 ]]; then MNT=${VCNVT_TEST_MNT:?}; fi
+ROOTFS=/  # the snapshot the Mac booted is mounted here
+if [[ ${VCNVT_TESTING:-0} -eq 1 ]]; then MNT=${VCNVT_TEST_MNT:?}; ROOTFS=${VCNVT_TEST_ROOT:-/}; fi
 LOG=/var/log/vcn-installer.log
 if [[ $VCNVT_TESTING -eq 1 ]]; then LOG=${VCNVT_TEST_MNT}.log; fi
 
@@ -375,7 +376,7 @@ EOF
   if [[ "$base" == "$(booted_snapshot)" ]]; then
     # The snapshot the Mac booted is already mounted read-only at /, and APFS refuses to mount the same snapshot a
     # second time (mount_apfs: "Resource busy", rc 75; seen on Sequoia 15.8.3 and Tahoe 26.7.3). / is that snapshot.
-    snap=$(volume_fingerprint /)
+    snap=$(volume_fingerprint "$ROOTFS")
   else
     d=$(mount_snapshot "$vol" "$name") || { echo "could not mount snapshot $name to compare; refusing" >&2; return 1; }
     snap=$(volume_fingerprint "$d")
