@@ -19,6 +19,8 @@ label=com.droga.vcnencodefix
 bin_dst=/usr/local/libexec/vcnencodefix
 plist_dst=/Library/LaunchDaemons/$label.plist
 log=/var/log/vcnencodefix.log
+vp_domain=/Library/Preferences/com.apple.VideoProcessing
+svcer_marker=/usr/local/libexec/vcnencodefix.svcer
 kext_src=$here/Kexts/VCNEncodeFloor.kext
 
 say()  { print -r -- "$@"; }
@@ -126,6 +128,21 @@ running=1
 pid=$(pgrep -f "^$bin_dst watch" | head -1)
 if [[ -n $pid ]]; then say "running (pid $pid)"; else say "warning: the service is not running; see $log"; running=0; fi
 tail -4 $log | sed 's/^/  /'
+
+# cc also needs VideoProcessing's TempSVCER switch off, for every user: /Library/Preferences/com.apple.VideoProcessing.plist.
+# What was there is kept once, in $svcer_marker, so uninstall.sh puts it back.
+if (( ${args[(Ie)--no-cc]} == 0 )) && print -r -- $status_out | grep -Eq '^ *cc +available'; then
+  step "Video calls (cc): TempSVCER off for all users"
+  if [[ ! -e $svcer_marker ]]; then
+    prev=$(defaults read $vp_domain TempSVCER 2>/dev/null) || prev=none
+    print -r -- $prev > $svcer_marker
+  fi
+  if defaults write $vp_domain TempSVCER -bool false; then
+    say "set TempSVCER = false in $vp_domain.plist (not tested in a real call yet)"
+  else
+    say "warning: could not write $vp_domain.plist; set it by hand: sudo defaults write $vp_domain TempSVCER -bool false"
+  fi
+fi
 
 step "Kernel half (VCNEncodeFloor.kext, VCN clock floor)"
 loaded=$(kextstat -l -b com.droga.VCNEncodeFloor 2>/dev/null | awk '{print $7}' | tr -d '()')

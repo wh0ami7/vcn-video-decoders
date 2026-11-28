@@ -47,6 +47,20 @@ for f in /usr/local/libexec/vcnencodefix /usr/local/libexec/vcnencodefix.new /et
 done
 say "the log /var/log/vcnencodefix.log was kept"
 
+# cc's TempSVCER switch: put back what install.sh found (nothing, true or false)
+vp_domain=/Library/Preferences/com.apple.VideoProcessing
+svcer_marker=/usr/local/libexec/vcnencodefix.svcer
+if exists $svcer_marker; then
+  prev=$(<$svcer_marker)
+  case $prev in
+    none) defaults delete $vp_domain TempSVCER 2>/dev/null && say "removed TempSVCER from $vp_domain.plist" ;;
+    1) defaults write $vp_domain TempSVCER -bool true && say "TempSVCER back to true in $vp_domain.plist" ;;
+    0) defaults write $vp_domain TempSVCER -bool false && say "TempSVCER back to false in $vp_domain.plist" ;;
+    *) say "warning: unexpected content in $svcer_marker; TempSVCER was left as it is" ;;
+  esac
+  rm -f -- $svcer_marker
+fi
+
 if [[ -n $efi ]]; then
   $tool efi-remove $cfg || die "config.plist was not changed; see the message above. The kext was left on the EFI."
   k=$efi/EFI/OC/Kexts/VCNEncodeFloor.kext

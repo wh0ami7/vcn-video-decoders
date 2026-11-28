@@ -36,6 +36,13 @@ From 1.3.0 the service also fixes one decoding problem:
 The cc fix was checked in IDA and with CPU tests on 15.8.2 and 26.7.3, and run with a real iPhone camera on an RX 6900 XT
 (15.8.2); a FaceTime call was not tested yet (see Limitations).
 
+From 1.5.2 the installer also sets VideoProcessing's `TempSVCER` switch to off for every user, when the cc fix is on
+(not `--no-cc`, and `status` shows `cc available`): `install.sh` runs
+`sudo defaults write /Library/Preferences/com.apple.VideoProcessing TempSVCER -bool false`, which writes
+`/Library/Preferences/com.apple.VideoProcessing.plist`. It keeps what was there (nothing, true or false) in
+`/usr/local/libexec/vcnencodefix.svcer` and `uninstall.sh` puts it back. **Not tested in a real call yet**: the
+setting is written and read back, but no FaceTime call or Continuity Camera session has been run with it.
+
 From 1.5.0 the cc fix also covers FaceTime's own video encoder:
 
 | Problem | What you see | Fixed by |

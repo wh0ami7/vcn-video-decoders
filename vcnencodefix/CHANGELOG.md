@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.2 (not released)
+
+- When the cc fix is on, `install.sh` (and so the installer app and CLI) sets `TempSVCER` to false for every user in
+  `/Library/Preferences/com.apple.VideoProcessing.plist` (`sudo defaults write /Library/Preferences/com.apple.VideoProcessing
+  TempSVCER -bool false`). The previous value is kept in `/usr/local/libexec/vcnencodefix.svcer` and `uninstall.sh` restores it.
+  `--no-cc`, or a macOS build where cc is unavailable, leaves the preference alone. Not tested in a real call yet.
+
 ## 1.5.1 (not released)
 
 - *cc* also patches `AirPlayXPCHelper`, the AirPlay sender's video encoder host. For an extended display or
